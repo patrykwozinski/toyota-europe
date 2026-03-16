@@ -11,8 +11,8 @@ Requires **Python 3.12+**.
 
 ```bash
 # 1. Clone the project
-git clone <repo-url>
-cd trips
+git clone git@github.com:patrykwozinski/toyota-europe.git
+cd toyota-europe
 
 # 2. Create a virtual environment and install dependencies
 python3 -m venv .venv
