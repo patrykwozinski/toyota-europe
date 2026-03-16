@@ -276,29 +276,9 @@ def upsert_trips(conn: sqlite3.Connection, trips: list, vin: str) -> tuple[int, 
     return inserted, updated
 
 
-def get_fetch_start(conn: sqlite3.Connection) -> date:
-    """Start from the last known trip date (with 1-day overlap for safety)."""
-    row = conn.execute(
-        "SELECT MAX(trip_start_time) FROM trips"
-    ).fetchone()
-    if row and row[0]:
-        return datetime.fromisoformat(row[0]).date()
-    return FULL_BACKFILL_START
 
-
-async def fetch_all_trips(client: MyT, vin: str, start_date: date) -> tuple[list, object]:
-    """Fetch all trips from start_date to today with windowing. Returns (trips, vehicle)."""
-    vehicles = await client.get_vehicles()
-    vehicle = next((v for v in vehicles if v.vin == vin), None)
-
-    if vehicle is None:
-        print(f"Vehicle {vin} not found. Available VINs:")
-        for v in vehicles:
-            print(f"  - {v.vin} ({v.alias})")
-        sys.exit(1)
-
-    print(f"Found vehicle: {vehicle.vin} ({vehicle.alias})")
-
+async def fetch_all_trips(vehicle, start_date: date) -> list:
+    """Fetch all trips from start_date to today with windowing."""
     all_trips = []
     window_start = start_date
 
@@ -318,7 +298,7 @@ async def fetch_all_trips(client: MyT, vin: str, start_date: date) -> tuple[list
 
         window_start = window_end + timedelta(days=1)
 
-    return all_trips, vehicle
+    return all_trips
 
 
 async def fetch_and_store_service_history(vehicle, conn: sqlite3.Connection, vin: str) -> int:
@@ -389,42 +369,22 @@ async def store_telemetry_snapshot(vehicle, conn: sqlite3.Connection, vin: str) 
     print(f"  Telemetry snapshot saved (odometer: {dash.odometer}, fuel: {dash.fuel_level}%)")
 
 
-async def main():
-    full = "--full" in sys.argv
+def get_fetch_start_for_vin(conn: sqlite3.Connection, vin: str) -> date:
+    """Start from the last known trip date for a specific VIN."""
+    row = conn.execute(
+        "SELECT MAX(trip_start_time) FROM trips WHERE vin = ?", (vin,)
+    ).fetchone()
+    if row and row[0]:
+        return datetime.fromisoformat(row[0]).date()
+    return FULL_BACKFILL_START
 
-    username = os.environ.get("CAR_USERNAME")
-    password = os.environ.get("CAR_PASSWORD")
-    vin = os.environ.get("CAR_VIN")
-    brand = os.environ.get("CAR_BRAND", "L").upper()
 
-    if brand not in ("L", "T"):
-        print(f"Invalid CAR_BRAND '{brand}'. Use 'L' (Lexus) or 'T' (Toyota).")
-        sys.exit(1)
-
-    if not username or not password or not vin:
-        print("Set CAR_USERNAME, CAR_PASSWORD, and CAR_VIN environment variables.")
-        print("  Optional: CAR_BRAND=L (Lexus, default) or CAR_BRAND=T (Toyota)")
-        sys.exit(1)
-
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
-    migrate_db(conn)
-
-    if full:
-        start_date = FULL_BACKFILL_START
-        print("Full backfill requested.")
-    else:
-        start_date = get_fetch_start(conn)
-        print(f"Incremental mode: fetching from {start_date}")
-
-    brand_label = "Lexus" if brand == "L" else "Toyota"
-    print(f"Logging in as {username} (brand={brand}, {brand_label})...")
-    client = MyT(username=username, password=password, brand=brand)
-    await client.login()
-    print("Login successful!")
-
-    print(f"\nFetching trips from {start_date} to {BACKFILL_END}...")
-    trips, vehicle = await fetch_all_trips(client, vin, start_date)
+async def process_vehicle(vehicle, conn: sqlite3.Connection, brand_label: str, full: bool) -> None:
+    """Fetch and store all data for a single vehicle."""
+    vin = vehicle.vin
+    print(f"\n{'='*60}")
+    print(f"Vehicle: {vehicle.alias} ({vin})")
+    print(f"{'='*60}")
 
     # Store vehicle info
     conn.execute(
@@ -433,26 +393,82 @@ async def main():
     )
     conn.commit()
 
+    if full:
+        start_date = FULL_BACKFILL_START
+        print("Full backfill requested.")
+    else:
+        start_date = get_fetch_start_for_vin(conn, vin)
+        print(f"Incremental mode: fetching from {start_date}")
+
+    print(f"Fetching trips from {start_date} to {BACKFILL_END}...")
+    trips = await fetch_all_trips(vehicle, start_date)
+
     if not trips:
         print("No new trips found.")
     else:
         print(f"\nTotal trips fetched: {len(trips)}")
 
-        before = conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
+        before = conn.execute(
+            "SELECT COUNT(*) FROM trips WHERE vin = ?", (vin,)
+        ).fetchone()[0]
         inserted, updated = upsert_trips(conn, trips, vin)
-        after = conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
-        waypoints = conn.execute("SELECT COUNT(*) FROM waypoints").fetchone()[0]
+        after = conn.execute(
+            "SELECT COUNT(*) FROM trips WHERE vin = ?", (vin,)
+        ).fetchone()[0]
 
-        print(f"\nDatabase: {DB_PATH}")
         print(f"  Before: {before} trips")
         print(f"  Inserted: {inserted}, Updated: {updated}")
-        print(f"  Total: {after} trips, {waypoints:,} waypoints")
+        print(f"  After: {after} trips")
 
     print("\nFetching service history & telemetry...")
     svc_count = await fetch_and_store_service_history(vehicle, conn, vin)
     print(f"  Service records: {svc_count}")
     await store_telemetry_snapshot(vehicle, conn, vin)
 
+
+async def main():
+    full = "--full" in sys.argv
+
+    username = os.environ.get("CAR_USERNAME")
+    password = os.environ.get("CAR_PASSWORD")
+    brand = os.environ.get("CAR_BRAND", "L").upper()
+
+    if brand not in ("L", "T"):
+        print(f"Invalid CAR_BRAND '{brand}'. Use 'L' (Lexus) or 'T' (Toyota).")
+        sys.exit(1)
+
+    if not username or not password:
+        print("Set CAR_USERNAME and CAR_PASSWORD environment variables.")
+        print("  Optional: CAR_BRAND=L (Lexus, default) or CAR_BRAND=T (Toyota)")
+        sys.exit(1)
+
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    migrate_db(conn)
+
+    brand_label = "Lexus" if brand == "L" else "Toyota"
+    print(f"Logging in as {username} (brand={brand}, {brand_label})...")
+    client = MyT(username=username, password=password, brand=brand)
+    await client.login()
+    print("Login successful!")
+
+    vehicles = await client.get_vehicles()
+    if not vehicles:
+        print("No vehicles found on this account.")
+        sys.exit(1)
+
+    print(f"\nFound {len(vehicles)} vehicle(s):")
+    for v in vehicles:
+        print(f"  - {v.alias} ({v.vin})")
+
+    for vehicle in vehicles:
+        await process_vehicle(vehicle, conn, brand_label, full)
+
+    total_trips = conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
+    total_wp = conn.execute("SELECT COUNT(*) FROM waypoints").fetchone()[0]
+    print(f"\n{'='*60}")
+    print(f"Database: {DB_PATH}")
+    print(f"  Total: {total_trips} trips, {total_wp:,} waypoints across {len(vehicles)} vehicle(s)")
     conn.close()
     print("Done!")
 

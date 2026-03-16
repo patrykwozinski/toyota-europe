@@ -12,16 +12,16 @@ Trip analytics pipeline for Lexus/Toyota vehicles. Fetches trip data from the co
 # Activate virtualenv
 source .venv/bin/activate
 
-# Fetch new trips (incremental, from last known trip date)
-CAR_USERNAME=... CAR_PASSWORD=... CAR_VIN=... python backfill.py
+# Fetch new trips for ALL vehicles on the account (incremental)
+CAR_USERNAME=... CAR_PASSWORD=... python backfill.py
 
 # Full historical backfill (from 2024-01-01)
-CAR_USERNAME=... CAR_PASSWORD=... CAR_VIN=... python backfill.py --full
+CAR_USERNAME=... CAR_PASSWORD=... python backfill.py --full
 
 # For Toyota vehicles, set CAR_BRAND=T (defaults to L for Lexus)
-CAR_BRAND=T CAR_USERNAME=... CAR_PASSWORD=... CAR_VIN=... python backfill.py
+CAR_BRAND=T CAR_USERNAME=... CAR_PASSWORD=... python backfill.py
 
-# Regenerate dashboard from trips.db
+# Regenerate dashboards from trips.db (one per vehicle)
 python build_dashboard.py
 ```
 
@@ -29,9 +29,9 @@ python build_dashboard.py
 
 **Two-script pipeline:**
 
-1. **`backfill.py`** — Async data ingestion from Lexus/Toyota API (`pytoyoda.client.MyT`). Supports both Lexus (`CAR_BRAND=L`, default) and Toyota (`CAR_BRAND=T`). Fetches trips in 30-day windows, upserts into SQLite with waypoints. Supports incremental (default) and full (`--full`) modes.
+1. **`backfill.py`** — Async data ingestion from Lexus/Toyota API (`pytoyoda.client.MyT`). Supports both Lexus (`CAR_BRAND=L`, default) and Toyota (`CAR_BRAND=T`). Automatically processes ALL vehicles on the account. Fetches trips in 30-day windows, upserts into SQLite with waypoints. Supports incremental (default) and full (`--full`) modes. `CAR_VIN` is no longer required.
 
-2. **`build_dashboard.py`** — Reads `trips.db`, computes aggregations (monthly stats, KPIs, seasonal analysis, trip categories, score distribution, rolling fuel efficiency), and generates a single `dashboard.html` with all data embedded as JSON. Uses Tailwind CSS, Chart.js, and Leaflet with heatmap overlay.
+2. **`build_dashboard.py`** — Reads `trips.db`, generates a separate `dashboard_{alias}.html` for each vehicle. Computes aggregations (monthly stats, KPIs, seasonal analysis, trip categories, score distribution, rolling fuel efficiency) per vehicle with all data embedded as JSON. Uses Tailwind CSS, Chart.js, and Leaflet with heatmap overlay.
 
 **Database (`trips.db`):** Tables — `trips` (keyed by `trip_start_time`), `waypoints` (keyed by `trip_start_time` + `idx`), `vehicles` (keyed by `vin`). The `fuel_consumed_l` column stores liters despite the code variable name `fuel_ml`.
 

@@ -7,3 +7,4 @@ __pycache__/
 # Generated data
 trips.db
 dashboard.html
+dashboard_*.html

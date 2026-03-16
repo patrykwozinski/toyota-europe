@@ -9,7 +9,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 DB_PATH = Path(__file__).parent / "trips.db"
-OUTPUT = Path(__file__).parent / "dashboard.html"
 
 # Monthly average PB95 prices in Poland (PLN/L)
 # Source: e-petrol.pl, bankier.pl, fuelo.net
@@ -30,21 +29,21 @@ def fuel_price_for(month: str) -> float:
     return FUEL_PRICES_PLN.get(month, FUEL_PRICE_DEFAULT)
 
 
-def load_vehicle_info(conn: sqlite3.Connection) -> dict:
-    """Load vehicle info from DB. Returns dict with 'alias' and 'brand'."""
+def load_all_vehicles(conn: sqlite3.Connection) -> list[dict]:
+    """Load all vehicles from DB. Returns list of dicts with 'vin', 'alias', 'brand'."""
     try:
-        row = conn.execute("SELECT alias, brand FROM vehicles LIMIT 1").fetchone()
-        if row:
-            return {"alias": row[0] or "My Car", "brand": row[1] or ""}
+        rows = conn.execute("SELECT vin, alias, brand FROM vehicles").fetchall()
+        if rows:
+            return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or ""} for r in rows]
     except sqlite3.OperationalError:
         pass  # table doesn't exist yet
-    return {"alias": "My Car", "brand": ""}
+    return []
 
 
-def load_trips(conn: sqlite3.Connection) -> list[dict]:
+def load_trips(conn: sqlite3.Connection, vin: str) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT * FROM trips ORDER BY trip_start_time"
+        "SELECT * FROM trips WHERE vin = ? ORDER BY trip_start_time", (vin,)
     ).fetchall()
     result = []
     for r in rows:
@@ -92,29 +91,33 @@ def load_trips(conn: sqlite3.Connection) -> list[dict]:
     return result
 
 
-def load_enriched_waypoints(conn: sqlite3.Connection) -> dict:
-    """Load waypoints grouped by type for layered heatmap."""
-    def _query(where=""):
-        sql = (
-            "SELECT ROUND(lat, 4) AS rlat, ROUND(lng, 4) AS rlng, COUNT(*) AS cnt "
-            f"FROM waypoints {where} GROUP BY rlat, rlng"
+def load_enriched_waypoints(conn: sqlite3.Connection, vin: str) -> dict:
+    """Load waypoints grouped by type for layered heatmap, filtered by VIN."""
+    def _query(extra_where=""):
+        base = (
+            "SELECT ROUND(w.lat, 4) AS rlat, ROUND(w.lng, 4) AS rlng, COUNT(*) AS cnt "
+            "FROM waypoints w JOIN trips t ON w.trip_start_time = t.trip_start_time "
+            "WHERE t.vin = ?"
         )
-        rows = conn.execute(sql).fetchall()
+        if extra_where:
+            base += f" AND {extra_where}"
+        base += " GROUP BY rlat, rlng"
+        rows = conn.execute(base, (vin,)).fetchall()
         return [[r[0], r[1], math.log1p(r[2])] for r in rows]
 
     return {
         "all": _query(),
-        "ev": _query("WHERE is_ev = 1"),
-        "highway": _query("WHERE highway = 1"),
-        "overspeed": _query("WHERE overspeed = 1"),
+        "ev": _query("w.is_ev = 1"),
+        "highway": _query("w.highway = 1"),
+        "overspeed": _query("w.overspeed = 1"),
     }
 
 
-def load_service_history(conn: sqlite3.Connection) -> list[dict]:
+def load_service_history(conn: sqlite3.Connection, vin: str) -> list[dict]:
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM service_history ORDER BY service_date DESC"
+            "SELECT * FROM service_history WHERE vin = ? ORDER BY service_date DESC", (vin,)
         ).fetchall()
         conn.row_factory = None
         return [
@@ -132,11 +135,11 @@ def load_service_history(conn: sqlite3.Connection) -> list[dict]:
         return []
 
 
-def load_telemetry_history(conn: sqlite3.Connection) -> list[dict]:
+def load_telemetry_history(conn: sqlite3.Connection, vin: str) -> list[dict]:
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM telemetry_snapshots ORDER BY captured_at"
+            "SELECT * FROM telemetry_snapshots WHERE vin = ? ORDER BY captured_at", (vin,)
         ).fetchall()
         conn.row_factory = None
         return [
@@ -1619,32 +1622,33 @@ function applyTheme(dark) {{
     return html
 
 
-def main():
-    if not DB_PATH.exists():
-        print(f"Database not found: {DB_PATH}")
-        print("Run backfill.py first.")
-        raise SystemExit(1)
+def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict) -> Path:
+    """Build a dashboard HTML for a single vehicle. Returns the output path."""
+    vin = vehicle["vin"]
+    alias = vehicle["alias"]
+    brand = vehicle["brand"]
+    label = f"{alias} ({brand})" if brand else alias
+    print(f"\n{'='*60}")
+    print(f"Building dashboard for: {label}")
+    print(f"{'='*60}")
 
-    conn = sqlite3.connect(DB_PATH)
-
-    vehicle = load_vehicle_info(conn)
-    print(f"Vehicle: {vehicle['alias']} ({vehicle['brand']})" if vehicle['brand'] else f"Vehicle: {vehicle['alias']}")
-
-    print("Loading trips from database...")
-    trips = load_trips(conn)
+    print("Loading trips...")
+    trips = load_trips(conn, vin)
     print(f"  {len(trips)} trips")
 
+    if not trips:
+        print(f"  Skipping {alias} — no trips.")
+        return None
+
     print("Loading heatmap waypoints...")
-    heatmap_layers = load_enriched_waypoints(conn)
+    heatmap_layers = load_enriched_waypoints(conn, vin)
     print(f"  {len(heatmap_layers['all'])} grid cells (all), {len(heatmap_layers['ev'])} (EV), "
           f"{len(heatmap_layers['highway'])} (highway), {len(heatmap_layers['overspeed'])} (overspeed)")
 
     print("Loading service history & telemetry...")
-    service_history = load_service_history(conn)
-    odometer_data = load_telemetry_history(conn)
+    service_history = load_service_history(conn, vin)
+    odometer_data = load_telemetry_history(conn, vin)
     print(f"  {len(service_history)} service records, {len(odometer_data)} telemetry snapshots")
-
-    conn.close()
 
     print("Computing aggregations...")
     kpis = compute_kpis(trips)
@@ -1664,10 +1668,53 @@ def main():
     html = build_html(kpis, monthly, wh, sd, heatmap_layers, lt, tc, sea, trips,
                       dm, sa, hc, nd, idle, service_history, odometer_data, vehicle)
 
-    OUTPUT.write_text(html)
-    size_mb = OUTPUT.stat().st_size / 1024 / 1024
-    print(f"\nDashboard saved to {OUTPUT} ({size_mb:.1f} MB)")
-    print("Open it in your browser!")
+    # Sanitize alias for filename
+    safe_alias = "".join(c if c.isalnum() or c in "-_ " else "" for c in alias).strip().replace(" ", "_")
+    output_path = Path(__file__).parent / f"dashboard_{safe_alias}.html"
+    output_path.write_text(html)
+    size_mb = output_path.stat().st_size / 1024 / 1024
+    print(f"  Saved to {output_path} ({size_mb:.1f} MB)")
+    return output_path
+
+
+def main():
+    if not DB_PATH.exists():
+        print(f"Database not found: {DB_PATH}")
+        print("Run backfill.py first.")
+        raise SystemExit(1)
+
+    conn = sqlite3.connect(DB_PATH)
+
+    vehicles = load_all_vehicles(conn)
+    if not vehicles:
+        # Fall back to distinct VINs from trips table
+        vins = conn.execute("SELECT DISTINCT vin FROM trips").fetchall()
+        vehicles = [{"vin": r[0], "alias": r[0][:8], "brand": ""} for r in vins if r[0]]
+    if not vehicles:
+        print("No vehicles found in database. Run backfill.py first.")
+        raise SystemExit(1)
+
+    print(f"Found {len(vehicles)} vehicle(s):")
+    for v in vehicles:
+        label = f"{v['alias']} ({v['brand']})" if v['brand'] else v['alias']
+        print(f"  - {label}")
+
+    outputs = []
+    for vehicle in vehicles:
+        path = build_dashboard_for_vehicle(conn, vehicle)
+        if path:
+            outputs.append(path)
+
+    conn.close()
+
+    if outputs:
+        print(f"\n{'='*60}")
+        print(f"Generated {len(outputs)} dashboard(s):")
+        for p in outputs:
+            print(f"  - {p}")
+        print("Open them in your browser!")
+    else:
+        print("\nNo dashboards generated (no trips found).")
 
 
 if __name__ == "__main__":
