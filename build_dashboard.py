@@ -238,20 +238,15 @@ def compute_score_distribution(trips: list[dict]) -> dict:
 
 
 def compute_trip_categories(trips: list[dict]) -> dict:
-    cats = {"Micro (<2 km)": 0, "Short (2-10 km)": 0, "Medium (10-30 km)": 0,
-            "Long (30-100 km)": 0, "Road trip (>100 km)": 0}
+    cats = {"Short (<10 km)": 0, "Medium (10-100)": 0, "Long (>100 km)": 0}
     for t in trips:
         d = t["distance_km"]
-        if d < 2:
-            cats["Micro (<2 km)"] += 1
-        elif d < 10:
-            cats["Short (2-10 km)"] += 1
-        elif d < 30:
-            cats["Medium (10-30 km)"] += 1
+        if d < 10:
+            cats["Short (<10 km)"] += 1
         elif d < 100:
-            cats["Long (30-100 km)"] += 1
+            cats["Medium (10-100)"] += 1
         else:
-            cats["Road trip (>100 km)"] += 1
+            cats["Long (>100 km)"] += 1
     return {"labels": list(cats.keys()), "counts": list(cats.values())}
 
 
@@ -382,14 +377,14 @@ def compute_driving_modes(trips: list[dict]) -> dict:
     total_charge_dist = sum(t["charge_distance_m"] / 1000 for t in trips)
 
     return {
-        "time_labels": ["EV", "Eco", "Power", "Charge"],
+        "time_labels": ["Electric", "Eco", "Power", "Charge"],
         "time_values": [
             round(total_ev_time / 3600, 1),
             round(total_eco_time / 3600, 1),
             round(total_power_time / 3600, 1),
             round(total_charge_time / 3600, 1),
         ],
-        "dist_labels": ["EV", "Eco", "Power", "Charge"],
+        "dist_labels": ["Electric", "Eco", "Power", "Charge"],
         "dist_values": [
             round(total_ev_dist, 1),
             round(total_eco_dist, 1),
@@ -648,7 +643,7 @@ tailwind.config = {{
   <div class="flex items-center justify-between mb-8">
     <div>
       <h1 class="text-3xl font-bold text-heading tracking-tight">{vehicle_name}</h1>
-      <p class="text-muted mt-1">Trip Analytics Dashboard</p>
+      <p class="text-muted mt-1">Trip Analytics Dashboard &middot; Hybrid</p>
     </div>
     <div class="flex items-center gap-4">
       <button id="themeToggle" onclick="applyTheme(!isDarkMode())" class="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors" title="Toggle theme">
@@ -682,7 +677,7 @@ tailwind.config = {{
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['ev_ratio_pct']}<span class="text-lg text-muted">%</span></div>
-      <div class="kpi-label">EV Distance Ratio</div>
+      <div class="kpi-label">Electric Driving</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['avg_score']}</div>
@@ -770,7 +765,7 @@ tailwind.config = {{
         <button class="heat-btn px-3 py-1 rounded-full text-sm text-white bg-lexus-600 transition-colors" data-layer="all" onclick="switchHeatLayer('all')">All</button>
         <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="ev" onclick="switchHeatLayer('ev')">EV</button>
         <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="highway" onclick="switchHeatLayer('highway')">Highway</button>
-        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="overspeed" onclick="switchHeatLayer('overspeed')">Overspeed</button>
+        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="overspeed" onclick="switchHeatLayer('overspeed')">Over Limit</button>
       </div>
     </div>
     <div id="heatmap"></div>
@@ -791,7 +786,7 @@ tailwind.config = {{
   <!-- Fuel Efficiency Trend -->
   <div class="card mb-8">
     <h3 class="text-lg font-semibold text-heading mb-4">Fuel Efficiency Trend (20-trip rolling avg, L/100km)</h3>
-    <canvas id="fuelTrend"></canvas>
+    <div style="height:200px"><canvas id="fuelTrend"></canvas></div>
   </div>
   </div><!-- /tab-overview -->
 
@@ -803,7 +798,7 @@ tailwind.config = {{
       <canvas id="monthlyFuel"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">EV vs ICE Distance by Month</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">Electric vs Fuel Distance by Month</h3>
       <canvas id="evIce"></canvas>
     </div>
   </div>
@@ -811,11 +806,11 @@ tailwind.config = {{
   <!-- Doughnut Charts Row -->
   <div class="grid grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Powertrain Time (h)</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">Drive Mode Time (h)</h3>
       <canvas id="modeTime"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Powertrain Distance (km)</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">Drive Mode Distance (km)</h3>
       <canvas id="modeDist"></canvas>
     </div>
     <div class="card">
@@ -879,11 +874,11 @@ tailwind.config = {{
   <!-- Score Charts -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Monthly Driving Score</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">Monthly Driving Score (Toyota app)</h3>
       <canvas id="monthlyScore"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Score Distribution</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">Driving Score Distribution</h3>
       <canvas id="scoreDist"></canvas>
     </div>
   </div>
@@ -949,7 +944,7 @@ tailwind.config = {{
 
   <footer class="text-center text-xs text-footer py-8">
     Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; {vehicle_name} Trip Dashboard
-    &middot; Fuel prices: PB95 monthly avg (e-petrol.pl)
+    &middot; Fuel prices: unleaded 95 monthly avg (e-petrol.pl)
   </footer>
 </div>
 
@@ -1067,7 +1062,7 @@ createChart('monthlyCost', {{
       backgroundColor: 'rgba(234,179,8,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'PB95 Price (PLN/L)',
+      label: 'Fuel Price (PLN/L)',
       data: D.monthly.fuel_price,
       type: 'line',
       borderColor: '#ef4444',
@@ -1112,18 +1107,18 @@ createChart('monthlyFuel', {{
   }}
 }});
 
-// --- EV vs ICE ---
+// --- Electric vs Fuel ---
 createChart('evIce', {{
   type: 'bar',
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'EV (km)',
+      label: 'Electric (km)',
       data: D.monthly.ev_distance,
       backgroundColor: 'rgba(34,197,94,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'ICE (km)',
+      label: 'Fuel (km)',
       data: D.monthly.distance.map((d,i) => Math.max(0, +(d - D.monthly.ev_distance[i]).toFixed(1))),
       backgroundColor: 'rgba(239,68,68,0.5)',
       borderRadius: 6,
@@ -1138,7 +1133,7 @@ createChart('evIce', {{
   }}
 }});
 
-// --- Powertrain State Time (Doughnut) ---
+// --- Drive Mode Time (Doughnut) ---
 createChart('modeTime', {{
   type: 'doughnut',
   data: {{
@@ -1158,7 +1153,7 @@ createChart('modeTime', {{
   }}
 }});
 
-// --- Powertrain State Distance (Doughnut) ---
+// --- Drive Mode Distance (Doughnut) ---
 createChart('modeDist', {{
   type: 'doughnut',
   data: {{
@@ -1311,7 +1306,7 @@ createChart('tripCats', {{
     labels: D.tripCats.labels,
     datasets: [{{
       data: D.tripCats.counts,
-      backgroundColor: ['#64748b','#0ea5e9','#a78bfa','#f59e0b','#ef4444'],
+      backgroundColor: ['#0ea5e9','#f59e0b','#ef4444'],
       borderWidth: 0,
     }}]
   }},
@@ -1329,7 +1324,7 @@ createChart('seasonalEv', {{
   data: {{
     labels: D.seasonal.labels,
     datasets: [{{
-      label: 'EV Ratio (%)',
+      label: 'Electric Ratio (%)',
       data: D.seasonal.ev_ratio,
       backgroundColor: ['#60a5fa','#34d399','#fbbf24','#f97316'],
       borderRadius: 6,
@@ -1485,6 +1480,7 @@ createChart('fuelTrend', {{
   }},
   options: {{
     responsive: true,
+    maintainAspectRatio: false,
     scales: {{
       y: {{ title: {{ display: true, text: 'L/100km' }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }}, ticks: {{ maxTicksLimit: 15 }} }}
