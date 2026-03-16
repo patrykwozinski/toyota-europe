@@ -30,6 +30,17 @@ def fuel_price_for(month: str) -> float:
     return FUEL_PRICES_PLN.get(month, FUEL_PRICE_DEFAULT)
 
 
+def load_vehicle_info(conn: sqlite3.Connection) -> dict:
+    """Load vehicle info from DB. Returns dict with 'alias' and 'brand'."""
+    try:
+        row = conn.execute("SELECT alias, brand FROM vehicles LIMIT 1").fetchone()
+        if row:
+            return {"alias": row[0] or "My Car", "brand": row[1] or ""}
+    except sqlite3.OperationalError:
+        pass  # table doesn't exist yet
+    return {"alias": "My Car", "brand": ""}
+
+
 def load_trips(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -489,7 +500,10 @@ def compute_idle_analysis(trips: list[dict]) -> dict:
 
 def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_trips,
                trip_cats, seasonal, trips, driving_modes, speed_analytics,
-               highway_city, night_driving, idle_trend, service_history, odometer_data):
+               highway_city, night_driving, idle_trend, service_history, odometer_data,
+               vehicle=None):
+    vehicle = vehicle or {"alias": "My Car", "brand": ""}
+    vehicle_name = vehicle["alias"]
     lats = [t["start_lat"] for t in trips if t["start_lat"] is not None]
     lngs = [t["start_lng"] for t in trips if t["start_lng"] is not None]
     center_lat = sorted(lats)[len(lats) // 2] if lats else 52.1
@@ -534,7 +548,7 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lexus NX350h Trip Dashboard</title>
+<title>{vehicle_name} Trip Dashboard</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
@@ -633,8 +647,8 @@ tailwind.config = {{
   <!-- Header -->
   <div class="flex items-center justify-between mb-8">
     <div>
-      <h1 class="text-3xl font-bold text-heading tracking-tight">Lexus NX 350h</h1>
-      <p class="text-muted mt-1">Omotenashi 2024 &middot; Trip Analytics Dashboard</p>
+      <h1 class="text-3xl font-bold text-heading tracking-tight">{vehicle_name}</h1>
+      <p class="text-muted mt-1">Trip Analytics Dashboard</p>
     </div>
     <div class="flex items-center gap-4">
       <button id="themeToggle" onclick="applyTheme(!isDarkMode())" class="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors" title="Toggle theme">
@@ -934,7 +948,7 @@ tailwind.config = {{
   </div><!-- /tab-trips -->
 
   <footer class="text-center text-xs text-footer py-8">
-    Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; Lexus NX 350h Omotenashi 2024 Trip Dashboard
+    Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; {vehicle_name} Trip Dashboard
     &middot; Fuel prices: PB95 monthly avg (e-petrol.pl)
   </footer>
 </div>
@@ -1617,6 +1631,9 @@ def main():
 
     conn = sqlite3.connect(DB_PATH)
 
+    vehicle = load_vehicle_info(conn)
+    print(f"Vehicle: {vehicle['alias']} ({vehicle['brand']})" if vehicle['brand'] else f"Vehicle: {vehicle['alias']}")
+
     print("Loading trips from database...")
     trips = load_trips(conn)
     print(f"  {len(trips)} trips")
@@ -1649,7 +1666,7 @@ def main():
 
     print("Building HTML...")
     html = build_html(kpis, monthly, wh, sd, heatmap_layers, lt, tc, sea, trips,
-                      dm, sa, hc, nd, idle, service_history, odometer_data)
+                      dm, sa, hc, nd, idle, service_history, odometer_data, vehicle)
 
     OUTPUT.write_text(html)
     size_mb = OUTPUT.stat().st_size / 1024 / 1024

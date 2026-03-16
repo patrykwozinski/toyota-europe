@@ -4,10 +4,6 @@ __pycache__/
 .cache/
 .DS_Store
 
-# Raw data exports from Toyota EDA
-JTJCKBEZX02039013/*.csv
-
-# Backfilled data (generated)
-JTJCKBEZX02039013/*.json
+# Generated data
 trips.db
 dashboard.html
