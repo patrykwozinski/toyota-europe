@@ -1,5 +1,6 @@
 """Build a self-contained HTML dashboard from trips.db."""
 
+import argparse
 import json
 import math
 import sqlite3
@@ -8,54 +9,53 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-DB_PATH = Path(__file__).parent / "trips.db"
+from fuel_config import (
+    get_country_info,
+    get_exchange_rate,
+    get_fuel_price,
+    load_cache,
+    save_cache,
+    COUNTRY_INFO,
+)
 
-# Monthly average PB95 prices in Poland (PLN/L)
-# Source: e-petrol.pl, bankier.pl, fuelo.net
-FUEL_PRICES_PLN = {
-    "2025-03": 5.96, "2025-04": 5.92, "2025-05": 5.74,
-    "2025-06": 6.01, "2025-07": 5.90, "2025-08": 5.80,
-    "2025-09": 5.82, "2025-10": 5.84, "2025-11": 5.80,
-    "2025-12": 5.73, "2026-01": 5.59, "2026-02": 5.71,
-    "2026-03": 6.19,
-}
-FUEL_PRICE_DEFAULT = 5.90  # fallback for months not in the table
+DB_PATH = Path(__file__).parent / "trips.db"
 
 # CO2 emission factor for gasoline: 2.31 kg CO2 per liter
 CO2_KG_PER_LITER = 2.31
 
 
-def fuel_price_for(month: str) -> float:
-    return FUEL_PRICES_PLN.get(month, FUEL_PRICE_DEFAULT)
-
-
 def load_all_vehicles(conn: sqlite3.Connection) -> list[dict]:
-    """Load all vehicles from DB. Returns list of dicts with 'vin', 'alias', 'brand'."""
+    """Load all vehicles from DB. Returns list of dicts with 'vin', 'alias', 'brand', 'fuel_type'."""
     try:
-        rows = conn.execute("SELECT vin, alias, brand FROM vehicles").fetchall()
+        rows = conn.execute("SELECT vin, alias, brand, fuel_type FROM vehicles").fetchall()
         if rows:
-            return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or ""} for r in rows]
+            return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or "", "fuel_type": r[3] or "gasoline"} for r in rows]
     except sqlite3.OperationalError:
-        pass  # table doesn't exist yet
+        try:
+            rows = conn.execute("SELECT vin, alias, brand FROM vehicles").fetchall()
+            if rows:
+                return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or "", "fuel_type": "gasoline"} for r in rows]
+        except sqlite3.OperationalError:
+            pass
     return []
 
 
-def load_trips(conn: sqlite3.Connection, vin: str) -> list[dict]:
+def load_trips(conn: sqlite3.Connection, vin: str, tz_name: str = "Europe/Warsaw") -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM trips WHERE vin = ? ORDER BY trip_start_time", (vin,)
     ).fetchall()
     result = []
+    tz = ZoneInfo(tz_name)
     for r in rows:
         d = dict(r)
-        warsaw = ZoneInfo("Europe/Warsaw")
-        start = datetime.fromisoformat(d["trip_start_time"]).astimezone(warsaw) if d.get("trip_start_time") else None
+        start = datetime.fromisoformat(d["trip_start_time"]).astimezone(tz) if d.get("trip_start_time") else None
         if not start:
             continue
         countries_raw = d.get("countries")
         result.append({
             "start": start,
-            "end": datetime.fromisoformat(d["trip_end_time"]).astimezone(warsaw) if d.get("trip_end_time") else None,
+            "end": datetime.fromisoformat(d["trip_end_time"]).astimezone(tz) if d.get("trip_end_time") else None,
             "duration_sec": d.get("duration_sec") or 0,
             "distance_km": d.get("distance_km") or 0,
             "ev_distance_km": d.get("ev_distance_km") or 0,
@@ -86,6 +86,8 @@ def load_trips(conn: sqlite3.Connection, vin: str) -> list[dict]:
             "overspeed_duration_sec": d.get("overspeed_duration_sec") or 0,
             "countries": json.loads(countries_raw) if countries_raw else [],
             "trip_category": d.get("trip_category"),
+            "score_constant": d.get("score_constant"),
+            "score_advice": d.get("score_advice"),
         })
     conn.row_factory = None
     return result
@@ -155,7 +157,7 @@ def load_telemetry_history(conn: sqlite3.Connection, vin: str) -> list[dict]:
         return []
 
 
-def compute_monthly(trips: list[dict]) -> dict:
+def compute_monthly(trips: list[dict], price_fn=None) -> dict:
     months: dict[str, dict] = defaultdict(lambda: {
         "trips": 0, "distance": 0, "ev_distance": 0, "fuel": 0, "duration": 0,
         "scores": [], "avg_speeds": [], "highway_km": 0,
@@ -191,11 +193,11 @@ def compute_monthly(trips: list[dict]) -> dict:
             if months[k]["scores"] else 0
             for k in labels
         ],
-        "fuel_cost_pln": [
-            round(months[k]["fuel"] * fuel_price_for(k), 2)
+        "fuel_cost": [
+            round(months[k]["fuel"] * price_fn(k), 2)
             for k in labels
         ],
-        "fuel_price": [fuel_price_for(k) for k in labels],
+        "fuel_price": [price_fn(k) for k in labels],
         "avg_speed": [
             round(sum(months[k]["avg_speeds"]) / len(months[k]["avg_speeds"]), 1)
             if months[k]["avg_speeds"] else 0
@@ -288,12 +290,12 @@ def compute_seasonal(trips: list[dict]) -> dict:
     }
 
 
-def top_trips(trips: list[dict], n: int = 15) -> list[dict]:
+def top_trips(trips: list[dict], n: int = 15, price_fn=None) -> list[dict]:
     longest = sorted(trips, key=lambda t: t["distance_km"], reverse=True)[:n]
     result = []
     for t in longest:
         month = t["start"].strftime("%Y-%m")
-        cost = t["fuel_ml"] * fuel_price_for(month)
+        cost = t["fuel_ml"] * price_fn(month)
         result.append({
             "date": t["start"].strftime("%Y-%m-%d %H:%M"),
             "distance": round(t["distance_km"], 1),
@@ -307,7 +309,7 @@ def top_trips(trips: list[dict], n: int = 15) -> list[dict]:
     return result
 
 
-def compute_kpis(trips: list[dict]) -> dict:
+def compute_kpis(trips: list[dict], price_fn=None) -> dict:
     total_dist = sum(t["distance_km"] for t in trips)
     total_ev = sum(t["ev_distance_km"] for t in trips)
     total_fuel = sum(t["fuel_ml"] for t in trips)
@@ -320,7 +322,7 @@ def compute_kpis(trips: list[dict]) -> dict:
     total_cost = 0.0
     for t in trips:
         month = t["start"].strftime("%Y-%m")
-        total_cost += t["fuel_ml"] * fuel_price_for(month)
+        total_cost += t["fuel_ml"] * price_fn(month)
 
     # CO2
     co2_emitted = total_fuel * CO2_KG_PER_LITER
@@ -351,7 +353,7 @@ def compute_kpis(trips: list[dict]) -> dict:
         "avg_trip_km": round(total_dist / len(trips), 1) if trips else 0,
         "first_trip": first,
         "last_trip": last,
-        "total_cost_pln": round(total_cost, 0),
+        "total_cost": round(total_cost, 0),
         "cost_per_km": round(total_cost / total_dist, 2) if total_dist > 0 else 0,
         "co2_emitted_kg": round(co2_emitted, 1),
         "co2_saved_kg": round(co2_saved, 1),
@@ -499,7 +501,8 @@ def compute_idle_analysis(trips: list[dict]) -> dict:
 def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_trips,
                trip_cats, seasonal, trips, driving_modes, speed_analytics,
                highway_city, night_driving, idle_trend, service_history, odometer_data,
-               vehicle=None):
+               vehicle=None, currency_code="PLN", currency_symbol="zl",
+               country_code="PL", fuel_type="gasoline"):
     vehicle = vehicle or {"alias": "My Car", "brand": ""}
     vehicle_name = vehicle["alias"]
     lats = [t["start_lat"] for t in trips if t["start_lat"] is not None]
@@ -539,6 +542,7 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
         "idleTrend": idle_trend,
         "serviceHistory": service_history,
         "odometerData": odometer_data,
+        "currency": {"code": currency_code, "symbol": currency_symbol},
     }
 
     html = f"""<!DOCTYPE html>
@@ -695,11 +699,11 @@ tailwind.config = {{
   <!-- KPI Cards Row 2 — Cost & Environment -->
   <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
     <div class="card">
-      <div class="kpi-value">{kpis['total_cost_pln']:,.0f}<span class="text-lg text-muted"> PLN</span></div>
+      <div class="kpi-value">{kpis['total_cost']:,.0f}<span class="text-lg text-muted"> {currency_code}</span></div>
       <div class="kpi-label">Total Fuel Cost</div>
     </div>
     <div class="card">
-      <div class="kpi-value">{kpis['cost_per_km']}<span class="text-lg text-muted"> PLN/km</span></div>
+      <div class="kpi-value">{kpis['cost_per_km']}<span class="text-lg text-muted"> {currency_code}/km</span></div>
       <div class="kpi-label">Cost per km</div>
     </div>
     <div class="card">
@@ -781,7 +785,7 @@ tailwind.config = {{
       <canvas id="monthlyDistance"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Monthly Fuel Cost (PLN)</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">Monthly Fuel Cost ({currency_code})</h3>
       <canvas id="monthlyCost"></canvas>
     </div>
   </div>
@@ -911,7 +915,7 @@ tailwind.config = {{
           <th class="text-right py-2 px-3">Distance (km)</th>
           <th class="text-right py-2 px-3">Duration (min)</th>
           <th class="text-right py-2 px-3">Fuel (L)</th>
-          <th class="text-right py-2 px-3">Cost (PLN)</th>
+          <th class="text-right py-2 px-3">Cost ({currency_code})</th>
           <th class="text-right py-2 px-3">EV %</th>
           <th class="text-right py-2 px-3">Max km/h</th>
           <th class="text-right py-2 px-3">Score</th>
@@ -947,7 +951,7 @@ tailwind.config = {{
 
   <footer class="text-center text-xs text-footer py-8">
     Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; {vehicle_name} Trip Dashboard
-    &middot; Fuel prices: unleaded 95 monthly avg (e-petrol.pl)
+    &middot; Fuel prices: {fuel_type} ({country_code}) in {currency_code}
   </footer>
 </div>
 
@@ -1060,12 +1064,12 @@ createChart('monthlyCost', {{
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'Fuel Cost (PLN)',
-      data: D.monthly.fuel_cost_pln,
+      label: 'Fuel Cost (' + D.currency.code + ')',
+      data: D.monthly.fuel_cost,
       backgroundColor: 'rgba(234,179,8,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'Fuel Price (PLN/L)',
+      label: 'Fuel Price (' + D.currency.code + '/L)',
       data: D.monthly.fuel_price,
       type: 'line',
       borderColor: '#ef4444',
@@ -1079,8 +1083,8 @@ createChart('monthlyCost', {{
     responsive: true,
     interaction: {{ mode: 'index', intersect: false }},
     scales: {{
-      y: {{ title: {{ display: true, text: 'PLN' }}, grid: {{ color: gridColor }} }},
-      y1: {{ position: 'right', title: {{ display: true, text: 'PLN/L' }}, grid: {{ display: false }} }},
+      y: {{ title: {{ display: true, text: D.currency.code }}, grid: {{ color: gridColor }} }},
+      y1: {{ position: 'right', title: {{ display: true, text: D.currency.code + '/L' }}, grid: {{ display: false }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1501,7 +1505,7 @@ D.longestTrips.forEach(t => {{
     <td class="text-right py-2 px-3 font-medium text-heading">${{t.distance}}</td>
     <td class="text-right py-2 px-3">${{t.duration_min}}</td>
     <td class="text-right py-2 px-3">${{t.fuel}}</td>
-    <td class="text-right py-2 px-3">${{t.cost}} PLN</td>
+    <td class="text-right py-2 px-3">${{t.cost}} ${{D.currency.code}}</td>
     <td class="text-right py-2 px-3">${{t.ev_pct}}%</td>
     <td class="text-right py-2 px-3">${{t.max_speed ?? '—'}}</td>
     <td class="text-right py-2 px-3">${{t.score ?? '—'}}</td>`;
@@ -1622,18 +1626,46 @@ function applyTheme(dark) {{
     return html
 
 
-def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict) -> Path:
+def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
+                                country_code: str = "PL",
+                                currency_code: str | None = None) -> Path:
     """Build a dashboard HTML for a single vehicle. Returns the output path."""
     vin = vehicle["vin"]
     alias = vehicle["alias"]
     brand = vehicle["brand"]
+    fuel_type = vehicle.get("fuel_type", "gasoline")
     label = f"{alias} ({brand})" if brand else alias
+
+    country_info = get_country_info(country_code)
+    tz_name = country_info["tz"]
+    native_currency = country_info["currency"]
+    display_currency = currency_code or native_currency
+    currency_symbol = country_info["symbol"]
+
+    # If display currency differs, look up symbol from any matching country
+    if display_currency != native_currency:
+        for info in COUNTRY_INFO.values():
+            if info["currency"] == display_currency:
+                currency_symbol = info["symbol"]
+                break
+
+    # Load cache and compute exchange rate
+    cache = load_cache()
+    exchange_rate = get_exchange_rate(native_currency, display_currency, cache)
+
+    # Build a price function that returns price in display currency
+    def price_fn(month: str) -> float:
+        native_price = get_fuel_price(country_code, month, fuel_type, conn=conn, cache=cache)
+        return round(native_price * exchange_rate, 2)
+
     print(f"\n{'='*60}")
     print(f"Building dashboard for: {label}")
+    print(f"  Country: {country_code}, Fuel: {fuel_type}, Currency: {display_currency}"
+          + (f" (rate: {exchange_rate:.4f})" if display_currency != native_currency else ""))
     print(f"{'='*60}")
 
     print("Loading trips...")
-    trips = load_trips(conn, vin)
+    trips = load_trips(conn, vin, tz_name)
     print(f"  {len(trips)} trips")
 
     if not trips:
@@ -1651,11 +1683,11 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict) -> Path
     print(f"  {len(service_history)} service records, {len(odometer_data)} telemetry snapshots")
 
     print("Computing aggregations...")
-    kpis = compute_kpis(trips)
-    monthly = compute_monthly(trips)
+    kpis = compute_kpis(trips, price_fn=price_fn)
+    monthly = compute_monthly(trips, price_fn=price_fn)
     wh = compute_weekday_hour(trips)
     sd = compute_score_distribution(trips)
-    lt = top_trips(trips)
+    lt = top_trips(trips, price_fn=price_fn)
     tc = compute_trip_categories(trips)
     sea = compute_seasonal(trips)
     dm = compute_driving_modes(trips)
@@ -1666,7 +1698,12 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict) -> Path
 
     print("Building HTML...")
     html = build_html(kpis, monthly, wh, sd, heatmap_layers, lt, tc, sea, trips,
-                      dm, sa, hc, nd, idle, service_history, odometer_data, vehicle)
+                      dm, sa, hc, nd, idle, service_history, odometer_data, vehicle,
+                      currency_code=display_currency, currency_symbol=currency_symbol,
+                      country_code=country_code, fuel_type=fuel_type)
+
+    # Save cache after all lookups
+    save_cache(cache)
 
     # Sanitize alias for filename
     safe_alias = "".join(c if c.isalnum() or c in "-_ " else "" for c in alias).strip().replace(" ", "_")
@@ -1677,13 +1714,50 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict) -> Path
     return output_path
 
 
+def load_vehicle_fuel_type(conn: sqlite3.Connection, vin: str) -> str:
+    """Read the fuel_type column from vehicles table."""
+    try:
+        row = conn.execute("SELECT fuel_type FROM vehicles WHERE vin = ?", (vin,)).fetchone()
+        if row and row[0]:
+            return row[0]
+    except sqlite3.OperationalError:
+        pass
+    return "gasoline"
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Build trip analytics dashboard(s).")
+    parser.add_argument("--country", default="PL",
+                        help="ISO country code for fuel prices (default: PL)")
+    parser.add_argument("--currency", default=None,
+                        help="Display currency code (default: country's native currency)")
+    args = parser.parse_args()
+
+    country_code = args.country.upper()
+    # Validate country
+    get_country_info(country_code)
+
     if not DB_PATH.exists():
         print(f"Database not found: {DB_PATH}")
         print("Run backfill.py first.")
         raise SystemExit(1)
 
     conn = sqlite3.connect(DB_PATH)
+
+    # Ensure fuel_prices table exists (for users who haven't re-run backfill yet)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fuel_prices (
+            country   TEXT NOT NULL,
+            month     TEXT NOT NULL,
+            fuel_type TEXT NOT NULL DEFAULT 'gasoline',
+            currency  TEXT NOT NULL,
+            price     REAL NOT NULL,
+            source    TEXT DEFAULT 'scraped',
+            PRIMARY KEY (country, month, fuel_type)
+        )
+    """)
+    from fuel_config import seed_pl_prices
+    seed_pl_prices(conn)
 
     vehicles = load_all_vehicles(conn)
     if not vehicles:
@@ -1694,14 +1768,20 @@ def main():
         print("No vehicles found in database. Run backfill.py first.")
         raise SystemExit(1)
 
+    # Enrich vehicles with fuel_type from DB
+    for v in vehicles:
+        v["fuel_type"] = load_vehicle_fuel_type(conn, v["vin"])
+
     print(f"Found {len(vehicles)} vehicle(s):")
     for v in vehicles:
         label = f"{v['alias']} ({v['brand']})" if v['brand'] else v['alias']
-        print(f"  - {label}")
+        print(f"  - {label} [{v['fuel_type']}]")
 
     outputs = []
     for vehicle in vehicles:
-        path = build_dashboard_for_vehicle(conn, vehicle)
+        path = build_dashboard_for_vehicle(conn, vehicle,
+                                           country_code=country_code,
+                                           currency_code=args.currency)
         if path:
             outputs.append(path)
 
