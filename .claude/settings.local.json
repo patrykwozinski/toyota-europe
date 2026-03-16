@@ -15,7 +15,18 @@
       "Bash(open:*)",
       "Bash(python3:*)",
       "Bash(git reset:*)",
-      "Bash(git update-ref:*)"
+      "Bash(git update-ref:*)",
+      "WebFetch(domain:www.fuel-prices.eu)",
+      "WebFetch(domain:www.globalpetrolprices.com)",
+      "WebFetch(domain:data.europa.eu)",
+      "WebFetch(domain:energy.ec.europa.eu)",
+      "WebFetch(domain:www.bankier.pl)",
+      "WebFetch(domain:pl.fuelo.net)",
+      "WebFetch(domain:www.autocentrum.pl)",
+      "WebFetch(domain:tradingeconomics.com)",
+      "WebFetch(domain:www.petrolnet.pl)",
+      "WebFetch(domain:autokatalog.pl)",
+      "WebFetch(domain:cenypaliw.fyi)"
     ]
   }
 }

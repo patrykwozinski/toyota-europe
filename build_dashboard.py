@@ -10,6 +10,24 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent / "trips.db"
 OUTPUT = Path(__file__).parent / "dashboard.html"
 
+# Monthly average PB95 prices in Poland (PLN/L)
+# Source: e-petrol.pl, bankier.pl, fuelo.net
+FUEL_PRICES_PLN = {
+    "2025-03": 5.96, "2025-04": 5.92, "2025-05": 5.74,
+    "2025-06": 6.01, "2025-07": 5.90, "2025-08": 5.80,
+    "2025-09": 5.82, "2025-10": 5.84, "2025-11": 5.80,
+    "2025-12": 5.73, "2026-01": 5.59, "2026-02": 5.71,
+    "2026-03": 6.19,
+}
+FUEL_PRICE_DEFAULT = 5.90  # fallback for months not in the table
+
+# CO2 emission factor for gasoline: 2.31 kg CO2 per liter
+CO2_KG_PER_LITER = 2.31
+
+
+def fuel_price_for(month: str) -> float:
+    return FUEL_PRICES_PLN.get(month, FUEL_PRICE_DEFAULT)
+
 
 def load_trips(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
@@ -42,7 +60,6 @@ def load_trips(conn: sqlite3.Connection) -> list[dict]:
 
 
 def load_heatmap_points(conn: sqlite3.Connection) -> list[list]:
-    """Cluster waypoints by rounding to 4 decimals, log-scale intensity."""
     rows = conn.execute(
         "SELECT ROUND(lat, 4) AS rlat, ROUND(lng, 4) AS rlng, COUNT(*) AS cnt "
         "FROM waypoints GROUP BY rlat, rlng"
@@ -83,6 +100,11 @@ def compute_monthly(trips: list[dict]) -> dict:
             if months[k]["scores"] else 0
             for k in labels
         ],
+        "fuel_cost_pln": [
+            round(months[k]["fuel"] * fuel_price_for(k), 2)
+            for k in labels
+        ],
+        "fuel_price": [fuel_price_for(k) for k in labels],
     }
 
 
@@ -121,15 +143,71 @@ def compute_score_distribution(trips: list[dict]) -> dict:
     }
 
 
+def compute_trip_categories(trips: list[dict]) -> dict:
+    cats = {"Micro (<2 km)": 0, "Short (2-10 km)": 0, "Medium (10-30 km)": 0,
+            "Long (30-100 km)": 0, "Road trip (>100 km)": 0}
+    for t in trips:
+        d = t["distance_km"]
+        if d < 2:
+            cats["Micro (<2 km)"] += 1
+        elif d < 10:
+            cats["Short (2-10 km)"] += 1
+        elif d < 30:
+            cats["Medium (10-30 km)"] += 1
+        elif d < 100:
+            cats["Long (30-100 km)"] += 1
+        else:
+            cats["Road trip (>100 km)"] += 1
+    return {"labels": list(cats.keys()), "counts": list(cats.values())}
+
+
+def compute_seasonal(trips: list[dict]) -> dict:
+    seasons = {"Winter": {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
+               "Spring": {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
+               "Summer": {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
+               "Autumn": {"ev": 0, "total": 0, "fuel": 0, "dist": 0}}
+    for t in trips:
+        m = t["start"].month
+        if m in (12, 1, 2):
+            s = "Winter"
+        elif m in (3, 4, 5):
+            s = "Spring"
+        elif m in (6, 7, 8):
+            s = "Summer"
+        else:
+            s = "Autumn"
+        seasons[s]["ev"] += t["ev_distance_km"]
+        seasons[s]["total"] += t["distance_km"]
+        seasons[s]["fuel"] += t["fuel_ml"]
+        seasons[s]["dist"] += t["distance_km"]
+    labels = ["Winter", "Spring", "Summer", "Autumn"]
+    return {
+        "labels": labels,
+        "ev_ratio": [
+            round(seasons[s]["ev"] / seasons[s]["total"] * 100, 1)
+            if seasons[s]["total"] > 0 else 0
+            for s in labels
+        ],
+        "avg_fuel": [
+            round(seasons[s]["fuel"] / seasons[s]["dist"] * 100, 2)
+            if seasons[s]["dist"] > 0 else 0
+            for s in labels
+        ],
+    }
+
+
 def top_trips(trips: list[dict], n: int = 15) -> list[dict]:
     longest = sorted(trips, key=lambda t: t["distance_km"], reverse=True)[:n]
     result = []
     for t in longest:
+        month = t["start"].strftime("%Y-%m")
+        cost = t["fuel_ml"] * fuel_price_for(month)
         result.append({
             "date": t["start"].strftime("%Y-%m-%d %H:%M"),
             "distance": round(t["distance_km"], 1),
             "duration_min": round(t["duration_sec"] / 60, 1),
             "fuel": round(t["fuel_ml"], 2),
+            "cost": round(cost, 2),
             "ev_pct": round(t["ev_distance_km"] / t["distance_km"] * 100, 1) if t["distance_km"] > 0 else 0,
             "score": t["score"],
         })
@@ -144,22 +222,40 @@ def compute_kpis(trips: list[dict]) -> dict:
     scores = [t["score"] for t in trips if t["score"] is not None]
     first = trips[0]["start"].strftime("%b %d, %Y") if trips else "N/A"
     last = trips[-1]["start"].strftime("%b %d, %Y") if trips else "N/A"
+
+    # Fuel cost
+    total_cost = 0.0
+    for t in trips:
+        month = t["start"].strftime("%Y-%m")
+        total_cost += t["fuel_ml"] * fuel_price_for(month)
+
+    # CO2
+    co2_emitted = total_fuel * CO2_KG_PER_LITER
+    # How much CO2 would have been emitted if EV km were driven on ICE instead
+    avg_l100 = total_fuel / total_dist * 100 if total_dist > 0 else 0
+    co2_saved = (total_ev * avg_l100 / 100) * CO2_KG_PER_LITER if total_dist > 0 else 0
+
     return {
         "total_trips": len(trips),
         "total_distance_km": round(total_dist, 1),
         "total_ev_km": round(total_ev, 1),
         "ev_ratio_pct": round(total_ev / total_dist * 100, 1) if total_dist > 0 else 0,
         "total_fuel_l": round(total_fuel, 1),
-        "avg_fuel_l100km": round(total_fuel / total_dist * 100, 2) if total_dist > 0 else 0,
+        "avg_fuel_l100km": round(avg_l100, 2),
         "total_hours": round(total_dur / 3600, 1),
         "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
         "avg_trip_km": round(total_dist / len(trips), 1) if trips else 0,
         "first_trip": first,
         "last_trip": last,
+        "total_cost_pln": round(total_cost, 0),
+        "cost_per_km": round(total_cost / total_dist, 2) if total_dist > 0 else 0,
+        "co2_emitted_kg": round(co2_emitted, 1),
+        "co2_saved_kg": round(co2_saved, 1),
     }
 
 
-def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_pts, longest_trips, trips):
+def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_pts, longest_trips,
+               trip_cats, seasonal, trips):
     lats = [t["start_lat"] for t in trips if t["start_lat"] is not None]
     lngs = [t["start_lng"] for t in trips if t["start_lng"] is not None]
     center_lat = sorted(lats)[len(lats) // 2] if lats else 52.1
@@ -186,6 +282,8 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_pts, longest_tri
         "center": [center_lat, center_lng],
         "longestTrips": longest_trips,
         "rollingFuel": rolling_fuel,
+        "tripCats": trip_cats,
+        "seasonal": seasonal,
     }
 
     html = f"""<!DOCTYPE html>
@@ -218,6 +316,7 @@ tailwind.config = {{
   #heatmap {{ height: 500px; border-radius: 1rem; z-index: 1; }}
   .kpi-value {{ @apply text-3xl font-bold text-white; }}
   .kpi-label {{ @apply text-sm text-gray-400 mt-1; }}
+  .section-title {{ @apply text-xl font-semibold text-white mb-6 pb-2 border-b border-gray-800; }}
 </style>
 </head>
 <body class="dark bg-gray-950 text-gray-200 min-h-screen">
@@ -236,7 +335,7 @@ tailwind.config = {{
   </div>
 
   <!-- KPI Cards -->
-  <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4 mb-8">
+  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
     <div class="card">
       <div class="kpi-value">{kpis['total_trips']}</div>
       <div class="kpi-label">Total Trips</div>
@@ -258,6 +357,22 @@ tailwind.config = {{
       <div class="kpi-label">Avg Driving Score</div>
     </div>
     <div class="card">
+      <div class="kpi-value">{kpis['total_hours']:,.0f}<span class="text-lg text-gray-400"> h</span></div>
+      <div class="kpi-label">Time Driving</div>
+    </div>
+  </div>
+
+  <!-- Cost & Environment KPIs -->
+  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
+    <div class="card">
+      <div class="kpi-value">{kpis['total_cost_pln']:,.0f}<span class="text-lg text-gray-400"> PLN</span></div>
+      <div class="kpi-label">Total Fuel Cost</div>
+    </div>
+    <div class="card">
+      <div class="kpi-value">{kpis['cost_per_km']}<span class="text-lg text-gray-400"> PLN/km</span></div>
+      <div class="kpi-label">Cost per km</div>
+    </div>
+    <div class="card">
       <div class="kpi-value">{kpis['total_fuel_l']:,.0f}<span class="text-lg text-gray-400"> L</span></div>
       <div class="kpi-label">Total Fuel Used</div>
     </div>
@@ -266,16 +381,12 @@ tailwind.config = {{
       <div class="kpi-label">EV Distance</div>
     </div>
     <div class="card">
-      <div class="kpi-value">{kpis['total_hours']:,.0f}<span class="text-lg text-gray-400"> h</span></div>
-      <div class="kpi-label">Time Driving</div>
+      <div class="kpi-value">{kpis['co2_emitted_kg']:,.0f}<span class="text-lg text-gray-400"> kg</span></div>
+      <div class="kpi-label">CO2 Emitted</div>
     </div>
     <div class="card">
-      <div class="kpi-value">{kpis['avg_trip_km']}<span class="text-lg text-gray-400"> km</span></div>
-      <div class="kpi-label">Avg Trip Distance</div>
-    </div>
-    <div class="card">
-      <div class="kpi-value" id="heatmapPts">&mdash;</div>
-      <div class="kpi-label">GPS Waypoints</div>
+      <div class="kpi-value" style="color:#22c55e">{kpis['co2_saved_kg']:,.0f}<span class="text-lg text-gray-400"> kg</span></div>
+      <div class="kpi-label">CO2 Saved by EV</div>
     </div>
   </div>
 
@@ -283,7 +394,7 @@ tailwind.config = {{
   <div class="card mb-8 !p-0 overflow-hidden">
     <div class="p-6 pb-2">
       <h2 class="text-xl font-semibold text-white">Route Heatmap</h2>
-      <p class="text-sm text-gray-400">All {kpis['total_trips']} trips overlaid &middot; brighter = more frequent</p>
+      <p class="text-sm text-gray-400">All {kpis['total_trips']} trips overlaid &middot; brighter = more frequent &middot; <span id="heatmapPts"></span> waypoints</p>
     </div>
     <div id="heatmap"></div>
   </div>
@@ -295,20 +406,48 @@ tailwind.config = {{
       <canvas id="monthlyDistance"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-white mb-4">Monthly Fuel Consumption (L/100km)</h3>
-      <canvas id="monthlyFuel"></canvas>
+      <h3 class="text-lg font-semibold text-white mb-4">Monthly Fuel Cost (PLN)</h3>
+      <canvas id="monthlyCost"></canvas>
     </div>
   </div>
 
-  <!-- EV + Score Row -->
+  <!-- Fuel + EV Row -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+    <div class="card">
+      <h3 class="text-lg font-semibold text-white mb-4">Monthly Fuel Consumption (L/100km)</h3>
+      <canvas id="monthlyFuel"></canvas>
+    </div>
     <div class="card">
       <h3 class="text-lg font-semibold text-white mb-4">EV vs ICE Distance by Month</h3>
       <canvas id="evIce"></canvas>
     </div>
+  </div>
+
+  <!-- Trip Categories + Seasonal -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+    <div class="card">
+      <h3 class="text-lg font-semibold text-white mb-4">Trip Categories</h3>
+      <canvas id="tripCats"></canvas>
+    </div>
+    <div class="card">
+      <h3 class="text-lg font-semibold text-white mb-4">EV Ratio by Season</h3>
+      <canvas id="seasonalEv"></canvas>
+    </div>
+    <div class="card">
+      <h3 class="text-lg font-semibold text-white mb-4">Fuel Efficiency by Season (L/100km)</h3>
+      <canvas id="seasonalFuel"></canvas>
+    </div>
+  </div>
+
+  <!-- Score + Time Patterns -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
       <h3 class="text-lg font-semibold text-white mb-4">Monthly Driving Score</h3>
       <canvas id="monthlyScore"></canvas>
+    </div>
+    <div class="card">
+      <h3 class="text-lg font-semibold text-white mb-4">Driving Score Distribution</h3>
+      <canvas id="scoreDist"></canvas>
     </div>
   </div>
 
@@ -330,12 +469,6 @@ tailwind.config = {{
     <canvas id="fuelTrend"></canvas>
   </div>
 
-  <!-- Score Distribution -->
-  <div class="card mb-8">
-    <h3 class="text-lg font-semibold text-white mb-4">Driving Score Distribution</h3>
-    <canvas id="scoreDist"></canvas>
-  </div>
-
   <!-- Top Trips Table -->
   <div class="card mb-8 overflow-x-auto">
     <h3 class="text-lg font-semibold text-white mb-4">Longest Trips</h3>
@@ -346,6 +479,7 @@ tailwind.config = {{
           <th class="text-right py-2 px-3">Distance (km)</th>
           <th class="text-right py-2 px-3">Duration (min)</th>
           <th class="text-right py-2 px-3">Fuel (L)</th>
+          <th class="text-right py-2 px-3">Cost (PLN)</th>
           <th class="text-right py-2 px-3">EV %</th>
           <th class="text-right py-2 px-3">Score</th>
         </tr>
@@ -356,6 +490,7 @@ tailwind.config = {{
 
   <footer class="text-center text-xs text-gray-600 py-8">
     Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; Lexus NX 350h Omotenashi 2024 Trip Dashboard
+    &middot; Fuel prices: PB95 monthly avg (e-petrol.pl)
   </footer>
 </div>
 
@@ -413,6 +548,38 @@ new Chart(document.getElementById('monthlyDistance'), {{
   }}
 }});
 
+// --- Monthly Cost ---
+new Chart(document.getElementById('monthlyCost'), {{
+  type: 'bar',
+  data: {{
+    labels: D.monthly.labels,
+    datasets: [{{
+      label: 'Fuel Cost (PLN)',
+      data: D.monthly.fuel_cost_pln,
+      backgroundColor: 'rgba(234,179,8,0.7)',
+      borderRadius: 6,
+    }}, {{
+      label: 'PB95 Price (PLN/L)',
+      data: D.monthly.fuel_price,
+      type: 'line',
+      borderColor: '#ef4444',
+      backgroundColor: 'transparent',
+      yAxisID: 'y1',
+      tension: 0.3,
+      pointRadius: 4,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    interaction: {{ mode: 'index', intersect: false }},
+    scales: {{
+      y: {{ title: {{ display: true, text: 'PLN' }}, grid: {{ color: gridColor }} }},
+      y1: {{ position: 'right', title: {{ display: true, text: 'PLN/L' }}, grid: {{ display: false }} }},
+      x: {{ grid: {{ display: false }} }}
+    }}
+  }}
+}});
+
 // --- Monthly Fuel ---
 new Chart(document.getElementById('monthlyFuel'), {{
   type: 'line',
@@ -463,6 +630,69 @@ new Chart(document.getElementById('evIce'), {{
   }}
 }});
 
+// --- Trip Categories (Doughnut) ---
+new Chart(document.getElementById('tripCats'), {{
+  type: 'doughnut',
+  data: {{
+    labels: D.tripCats.labels,
+    datasets: [{{
+      data: D.tripCats.counts,
+      backgroundColor: ['#64748b','#0ea5e9','#a78bfa','#f59e0b','#ef4444'],
+      borderWidth: 0,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{
+      legend: {{ position: 'bottom', labels: {{ padding: 12 }} }}
+    }}
+  }}
+}});
+
+// --- Seasonal EV Ratio ---
+new Chart(document.getElementById('seasonalEv'), {{
+  type: 'bar',
+  data: {{
+    labels: D.seasonal.labels,
+    datasets: [{{
+      label: 'EV Ratio (%)',
+      data: D.seasonal.ev_ratio,
+      backgroundColor: ['#60a5fa','#34d399','#fbbf24','#f97316'],
+      borderRadius: 6,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{ legend: {{ display: false }} }},
+    scales: {{
+      y: {{ title: {{ display: true, text: '%' }}, grid: {{ color: gridColor }}, max: 100 }},
+      x: {{ grid: {{ display: false }} }}
+    }}
+  }}
+}});
+
+// --- Seasonal Fuel ---
+new Chart(document.getElementById('seasonalFuel'), {{
+  type: 'bar',
+  data: {{
+    labels: D.seasonal.labels,
+    datasets: [{{
+      label: 'L/100km',
+      data: D.seasonal.avg_fuel,
+      backgroundColor: ['#60a5fa','#34d399','#fbbf24','#f97316'],
+      borderRadius: 6,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{ legend: {{ display: false }} }},
+    scales: {{
+      y: {{ title: {{ display: true, text: 'L/100km' }}, grid: {{ color: gridColor }} }},
+      x: {{ grid: {{ display: false }} }}
+    }}
+  }}
+}});
+
 // --- Monthly Score ---
 new Chart(document.getElementById('monthlyScore'), {{
   type: 'line',
@@ -483,6 +713,31 @@ new Chart(document.getElementById('monthlyScore'), {{
     scales: {{
       y: {{ min: 50, max: 100, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }} }}
+    }}
+  }}
+}});
+
+// --- Score Dist ---
+new Chart(document.getElementById('scoreDist'), {{
+  type: 'bar',
+  data: {{
+    labels: D.scoreDist.labels,
+    datasets: [{{
+      label: 'Trips',
+      data: D.scoreDist.counts,
+      backgroundColor: D.scoreDist.labels.map((_,i) => {{
+        const h = (i / D.scoreDist.labels.length) * 120;
+        return `hsla(${{h}},70%,50%,0.7)`;
+      }}),
+      borderRadius: 4,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{ legend: {{ display: false }} }},
+    scales: {{
+      y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
+      x: {{ title: {{ display: true, text: 'Score Range' }}, grid: {{ display: false }} }}
     }}
   }}
 }});
@@ -563,31 +818,6 @@ new Chart(document.getElementById('fuelTrend'), {{
   }}
 }});
 
-// --- Score Dist ---
-new Chart(document.getElementById('scoreDist'), {{
-  type: 'bar',
-  data: {{
-    labels: D.scoreDist.labels,
-    datasets: [{{
-      label: 'Trips',
-      data: D.scoreDist.counts,
-      backgroundColor: D.scoreDist.labels.map((_,i) => {{
-        const h = (i / D.scoreDist.labels.length) * 120;
-        return `hsla(${{h}},70%,50%,0.7)`;
-      }}),
-      borderRadius: 4,
-    }}]
-  }},
-  options: {{
-    responsive: true,
-    plugins: {{ legend: {{ display: false }} }},
-    scales: {{
-      y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
-      x: {{ title: {{ display: true, text: 'Score Range' }}, grid: {{ display: false }} }}
-    }}
-  }}
-}});
-
 // --- Top Trips Table ---
 const tbody = document.getElementById('topTripsBody');
 D.longestTrips.forEach(t => {{
@@ -598,6 +828,7 @@ D.longestTrips.forEach(t => {{
     <td class="text-right py-2 px-3 font-medium text-white">${{t.distance}}</td>
     <td class="text-right py-2 px-3">${{t.duration_min}}</td>
     <td class="text-right py-2 px-3">${{t.fuel}}</td>
+    <td class="text-right py-2 px-3">${{t.cost}} PLN</td>
     <td class="text-right py-2 px-3">${{t.ev_pct}}%</td>
     <td class="text-right py-2 px-3">${{t.score ?? '—'}}</td>`;
   tbody.appendChild(tr);
@@ -611,7 +842,7 @@ D.longestTrips.forEach(t => {{
 def main():
     if not DB_PATH.exists():
         print(f"Database not found: {DB_PATH}")
-        print("Run migrate_csv_to_db.py or backfill.py first.")
+        print("Run backfill.py first.")
         raise SystemExit(1)
 
     conn = sqlite3.connect(DB_PATH)
@@ -632,9 +863,11 @@ def main():
     wh = compute_weekday_hour(trips)
     sd = compute_score_distribution(trips)
     lt = top_trips(trips)
+    tc = compute_trip_categories(trips)
+    sea = compute_seasonal(trips)
 
     print("Building HTML...")
-    html = build_html(kpis, monthly, wh, sd, heatmap, lt, trips)
+    html = build_html(kpis, monthly, wh, sd, heatmap, lt, tc, sea, trips)
 
     OUTPUT.write_text(html)
     size_mb = OUTPUT.stat().st_size / 1024 / 1024
