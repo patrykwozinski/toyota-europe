@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .cache/
+.claude/settings.local.json
 .DS_Store
 
 # Generated data
