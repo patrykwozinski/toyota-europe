@@ -139,10 +139,7 @@ def get_fetch_start(conn: sqlite3.Connection) -> date:
     ).fetchone()
     if row and row[0]:
         from datetime import datetime as dt
-        last = dt.fromisoformat(row[0]).date()
-        # Overlap by 1 day to catch any trips that might have been
-        # in-progress when we last fetched
-        return last - timedelta(days=1)
+        return dt.fromisoformat(row[0]).date()
     return FULL_BACKFILL_START
 
 
