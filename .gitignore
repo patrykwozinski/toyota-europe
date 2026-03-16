@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Raw data exports from Toyota EDA
+JTJCKBEZX02039013/*.csv
+
+# Backfilled data (generated)
+JTJCKBEZX02039013/*.json
+trips.db
+dashboard.html

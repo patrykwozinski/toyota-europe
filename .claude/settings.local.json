@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebSearch",
+      "Bash(python3 -m venv .venv && source .venv/bin/activate && pip install \"pytoyoda @ git+https://github.com/pytoyoda/pytoyoda@main\" 2>&1 | tail -5)",
+      "Bash(source .venv/bin/activate && python backfill.py 2>&1)",
+      "Bash(source ~/.zshrc 2>/dev/null; source .venv/bin/activate && LOGURU_LEVEL=ERROR python backfill.py 2>&1)",
+      "Bash(source .venv/bin/activate && python3 -c \"\nimport inspect\nfrom pytoyoda.models.vehicle import Vehicle\nsig = inspect.signature\\(Vehicle.get_trips\\)\nprint\\('get_trips signature:', sig\\)\nsrc = inspect.getsource\\(Vehicle.get_trips\\)\nprint\\(src\\)\n\")",
+      "Bash(source .venv/bin/activate && python3 -c \"\nimport inspect\nfrom pytoyoda.models.trips import Trip\nprint\\([m for m in dir\\(Trip\\) if not m.startswith\\('_'\\)]\\)\nsrc = inspect.getsource\\(Trip\\)\nprint\\(src[:3000]\\)\n\")",
+      "Bash(git add:*)",
+      "Bash(python:*)",
+      "Bash(open:*)",
+      "Bash(python3:*)",
+      "Bash(git reset:*)",
+      "Bash(git update-ref:*)"
+    ]
+  }
+}
