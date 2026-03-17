@@ -9,4 +9,6 @@ __pycache__/
 trips.db
 dashboard.html
 dashboard_*.html
+commute_report.html
+commute_report_*.html
 fuel_prices.json
