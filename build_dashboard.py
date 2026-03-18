@@ -17,6 +17,7 @@ from fuel_config import (
     save_cache,
     COUNTRY_INFO,
 )
+from translations import get_translations
 
 DB_PATH = Path(__file__).parent / "trips.db"
 
@@ -207,23 +208,24 @@ def compute_monthly(trips: list[dict], price_fn=None) -> dict:
     }
 
 
-def compute_weekday_hour(trips: list[dict]) -> dict:
+def compute_weekday_hour(trips: list[dict], t: dict | None = None) -> dict:
     weekday_counts = [0] * 7
     weekday_dist = [0.0] * 7
     hour_counts = [0] * 24
     hour_dist = [0.0] * 24
-    for t in trips:
-        wd = t["start"].weekday()
-        h = t["start"].hour
+    for tr in trips:
+        wd = tr["start"].weekday()
+        h = tr["start"].hour
         weekday_counts[wd] += 1
-        weekday_dist[wd] += t["distance_km"]
+        weekday_dist[wd] += tr["distance_km"]
         hour_counts[h] += 1
-        hour_dist[h] += t["distance_km"]
+        hour_dist[h] += tr["distance_km"]
+    weekday_labels = t["weekdays"] if t else ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     return {
-        "weekday_labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        "weekday_labels": weekday_labels,
         "weekday_trips": weekday_counts,
         "weekday_distance": [round(d, 1) for d in weekday_dist],
-        "hour_labels": [f"{h:02d}" for h in range(24)],
+        "hour_labels": [f"{hh:02d}" for hh in range(24)],
         "hour_trips": hour_counts,
         "hour_distance": [round(d, 1) for d in hour_dist],
     }
@@ -242,39 +244,46 @@ def compute_score_distribution(trips: list[dict]) -> dict:
     }
 
 
-def compute_trip_categories(trips: list[dict]) -> dict:
-    cats = {"Short (<10 km)": 0, "Medium (10-100)": 0, "Long (>100 km)": 0}
-    for t in trips:
-        d = t["distance_km"]
+def compute_trip_categories(trips: list[dict], t: dict | None = None) -> dict:
+    short_label = t["cat_short"] if t else "Short (<10 km)"
+    medium_label = t["cat_medium"] if t else "Medium (10-100)"
+    long_label = t["cat_long"] if t else "Long (>100 km)"
+    cats = {short_label: 0, medium_label: 0, long_label: 0}
+    for tr in trips:
+        d = tr["distance_km"]
         if d < 10:
-            cats["Short (<10 km)"] += 1
+            cats[short_label] += 1
         elif d < 100:
-            cats["Medium (10-100)"] += 1
+            cats[medium_label] += 1
         else:
-            cats["Long (>100 km)"] += 1
+            cats[long_label] += 1
     return {"labels": list(cats.keys()), "counts": list(cats.values())}
 
 
-def compute_seasonal(trips: list[dict]) -> dict:
-    seasons = {"Winter": {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
-               "Spring": {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
-               "Summer": {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
-               "Autumn": {"ev": 0, "total": 0, "fuel": 0, "dist": 0}}
-    for t in trips:
-        m = t["start"].month
+def compute_seasonal(trips: list[dict], t: dict | None = None) -> dict:
+    s_winter = t["season_winter"] if t else "Winter"
+    s_spring = t["season_spring"] if t else "Spring"
+    s_summer = t["season_summer"] if t else "Summer"
+    s_autumn = t["season_autumn"] if t else "Autumn"
+    seasons = {s_winter: {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
+               s_spring: {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
+               s_summer: {"ev": 0, "total": 0, "fuel": 0, "dist": 0},
+               s_autumn: {"ev": 0, "total": 0, "fuel": 0, "dist": 0}}
+    for tr in trips:
+        m = tr["start"].month
         if m in (12, 1, 2):
-            s = "Winter"
+            s = s_winter
         elif m in (3, 4, 5):
-            s = "Spring"
+            s = s_spring
         elif m in (6, 7, 8):
-            s = "Summer"
+            s = s_summer
         else:
-            s = "Autumn"
-        seasons[s]["ev"] += t["ev_distance_km"]
-        seasons[s]["total"] += t["distance_km"]
-        seasons[s]["fuel"] += t["fuel_ml"]
-        seasons[s]["dist"] += t["distance_km"]
-    labels = ["Winter", "Spring", "Summer", "Autumn"]
+            s = s_autumn
+        seasons[s]["ev"] += tr["ev_distance_km"]
+        seasons[s]["total"] += tr["distance_km"]
+        seasons[s]["fuel"] += tr["fuel_ml"]
+        seasons[s]["dist"] += tr["distance_km"]
+    labels = [s_winter, s_spring, s_summer, s_autumn]
     return {
         "labels": labels,
         "ev_ratio": [
@@ -290,23 +299,65 @@ def compute_seasonal(trips: list[dict]) -> dict:
     }
 
 
-def top_trips(trips: list[dict], n: int = 15, price_fn=None) -> list[dict]:
-    longest = sorted(trips, key=lambda t: t["distance_km"], reverse=True)[:n]
+def stitch_journeys(trips: list[dict], max_gap_min: int = 45) -> list[list[dict]]:
+    """Group consecutive trips with gap ≤ max_gap_min into journey legs."""
+    from datetime import timedelta
+    if not trips:
+        return []
+    max_gap = timedelta(minutes=max_gap_min)
+    journeys: list[list[dict]] = []
+    cur: list[dict] = [trips[0]]
+    for t in trips[1:]:
+        if cur[-1]["end"] is not None:
+            gap = t["start"] - cur[-1]["end"]
+            if timedelta(0) <= gap <= max_gap:
+                cur.append(t)
+                continue
+        journeys.append(cur)
+        cur = [t]
+    journeys.append(cur)
+    return journeys
+
+
+def top_journeys(trips: list[dict], n: int = 20, max_gap_min: int = 45, price_fn=None) -> list[dict]:
+    """Return top N longest journeys, stitching legs separated by ≤ max_gap_min minute breaks."""
+    journeys = stitch_journeys(trips, max_gap_min)
     result = []
-    for t in longest:
-        month = t["start"].strftime("%Y-%m")
-        cost = t["fuel_ml"] * price_fn(month)
+    for legs in journeys:
+        total_dist = sum(t["distance_km"] for t in legs)
+        driving_sec = sum(t["duration_sec"] for t in legs)
+        if legs[-1]["end"] and legs[0]["start"]:
+            total_sec = (legs[-1]["end"] - legs[0]["start"]).total_seconds()
+        else:
+            total_sec = driving_sec
+        total_fuel = sum(t["fuel_ml"] for t in legs)
+        avg_fuel = round(total_fuel / total_dist * 100, 2) if total_dist > 0 else 0
+        max_speed = max((t["max_speed_kmh"] for t in legs if t.get("max_speed_kmh")), default=None)
+        break_mins = []
+        for i in range(1, len(legs)):
+            if legs[i - 1]["end"]:
+                gap_sec = (legs[i]["start"] - legs[i - 1]["end"]).total_seconds()
+                if gap_sec > 0:
+                    break_mins.append(round(gap_sec / 60, 1))
+        cost = 0.0
+        if price_fn:
+            for t in legs:
+                month = t["start"].strftime("%Y-%m")
+                cost += t["fuel_ml"] * price_fn(month)
         result.append({
-            "date": t["start"].strftime("%Y-%m-%d %H:%M"),
-            "distance": round(t["distance_km"], 1),
-            "duration_min": round(t["duration_sec"] / 60, 1),
-            "fuel": round(t["fuel_ml"], 2),
+            "date": legs[0]["start"].strftime("%Y-%m-%d %H:%M"),
+            "distance": round(total_dist, 1),
+            "driving_min": round(driving_sec / 60, 1),
+            "total_min": round(total_sec / 60, 1),
+            "legs": len(legs),
+            "breaks": break_mins,
+            "fuel": round(total_fuel, 2),
+            "avg_fuel": avg_fuel,
             "cost": round(cost, 2),
-            "ev_pct": round(t["ev_distance_km"] / t["distance_km"] * 100, 1) if t["distance_km"] > 0 else 0,
-            "score": t["score"],
-            "max_speed": round(t["max_speed_kmh"], 1) if t["max_speed_kmh"] else None,
+            "max_speed": round(max_speed, 1) if max_speed else None,
         })
-    return result
+    result.sort(key=lambda j: j["distance"], reverse=True)
+    return result[:n]
 
 
 def compute_kpis(trips: list[dict], price_fn=None) -> dict:
@@ -369,27 +420,33 @@ def compute_kpis(trips: list[dict], price_fn=None) -> dict:
     }
 
 
-def compute_driving_modes(trips: list[dict]) -> dict:
+def compute_driving_modes(trips: list[dict], t: dict | None = None) -> dict:
     """Total EV/Eco/Power/Charge time and distance breakdown."""
-    total_ev_time = sum(t["ev_duration_sec"] for t in trips)
-    total_eco_time = sum(t["eco_time_sec"] for t in trips)
-    total_power_time = sum(t["power_time_sec"] for t in trips)
-    total_charge_time = sum(t["charge_time_sec"] for t in trips)
+    total_ev_time = sum(tr["ev_duration_sec"] for tr in trips)
+    total_eco_time = sum(tr["eco_time_sec"] for tr in trips)
+    total_power_time = sum(tr["power_time_sec"] for tr in trips)
+    total_charge_time = sum(tr["charge_time_sec"] for tr in trips)
 
-    total_ev_dist = sum(t["ev_distance_km"] for t in trips)
-    total_eco_dist = sum(t["eco_distance_m"] / 1000 for t in trips)
-    total_power_dist = sum(t["power_distance_m"] / 1000 for t in trips)
-    total_charge_dist = sum(t["charge_distance_m"] / 1000 for t in trips)
+    total_ev_dist = sum(tr["ev_distance_km"] for tr in trips)
+    total_eco_dist = sum(tr["eco_distance_m"] / 1000 for tr in trips)
+    total_power_dist = sum(tr["power_distance_m"] / 1000 for tr in trips)
+    total_charge_dist = sum(tr["charge_distance_m"] / 1000 for tr in trips)
 
+    mode_labels = [
+        t["mode_electric"] if t else "Electric",
+        t["mode_eco"] if t else "Eco",
+        t["mode_power"] if t else "Power",
+        t["mode_charge"] if t else "Charge",
+    ]
     return {
-        "time_labels": ["Electric", "Eco", "Power", "Charge"],
+        "time_labels": mode_labels,
         "time_values": [
             round(total_ev_time / 3600, 1),
             round(total_eco_time / 3600, 1),
             round(total_power_time / 3600, 1),
             round(total_charge_time / 3600, 1),
         ],
-        "dist_labels": ["Electric", "Eco", "Power", "Charge"],
+        "dist_labels": mode_labels,
         "dist_values": [
             round(total_ev_dist, 1),
             round(total_eco_dist, 1),
@@ -498,12 +555,13 @@ def compute_idle_analysis(trips: list[dict]) -> dict:
     }
 
 
-def compute_driving_profile(trips: list[dict]) -> dict:
+def compute_driving_profile(trips: list[dict], t: dict | None = None) -> dict:
     """Compute driving style profile with radar axes, classification, and habits."""
     if not trips:
         return {
             "radar": {"labels": [], "values": []},
-            "classification": {"label": "Unknown", "description": "Not enough data."},
+            "classification": {"label": t["class_unknown"] if t else "Unknown",
+                               "description": t["class_unknown_desc"] if t else "Not enough data."},
             "speedProfile": {"labels": [], "counts": []},
             "roadType": {"highway_pct": 0, "city_pct": 100},
             "tripDistribution": {"labels": [], "counts": []},
@@ -513,34 +571,34 @@ def compute_driving_profile(trips: list[dict]) -> dict:
     # --- Radar axes (0-100) ---
     # Smoothness: avg of score_accel + score_brake per trip
     smoothness_vals = []
-    for t in trips:
-        sa = t.get("score_accel")
-        sb = t.get("score_brake")
+    for tr in trips:
+        sa = tr.get("score_accel")
+        sb = tr.get("score_brake")
         if sa is not None and sb is not None:
             smoothness_vals.append((sa + sb) / 2)
     smoothness = sum(smoothness_vals) / len(smoothness_vals) if smoothness_vals else 50
 
     # Eco-Consciousness: eco mode time ratio + EV distance ratio
-    total_dur = sum(t["duration_sec"] for t in trips)
-    total_dist = sum(t["distance_km"] for t in trips)
-    eco_time = sum(t["eco_time_sec"] for t in trips)
-    ev_dist = sum(t["ev_distance_km"] for t in trips)
+    total_dur = sum(tr["duration_sec"] for tr in trips)
+    total_dist = sum(tr["distance_km"] for tr in trips)
+    eco_time = sum(tr["eco_time_sec"] for tr in trips)
+    ev_dist = sum(tr["ev_distance_km"] for tr in trips)
     eco_time_ratio = (eco_time / total_dur * 100) if total_dur > 0 else 0
     ev_dist_ratio = (ev_dist / total_dist * 100) if total_dist > 0 else 0
     eco_consciousness = min(100, (eco_time_ratio + ev_dist_ratio) / 2)
 
     # Speed Discipline: inverse of overspeed distance ratio
-    overspeed_dist = sum(t["overspeed_distance_m"] for t in trips)
+    overspeed_dist = sum(tr["overspeed_distance_m"] for tr in trips)
     overspeed_ratio = (overspeed_dist / (total_dist * 1000) * 100) if total_dist > 0 else 0
     speed_discipline = max(0, min(100, 100 - overspeed_ratio * 5))
 
     # Consistency: avg of score_constant
-    const_vals = [t["score_constant"] for t in trips if t.get("score_constant") is not None]
+    const_vals = [tr["score_constant"] for tr in trips if tr.get("score_constant") is not None]
     consistency = sum(const_vals) / len(const_vals) if const_vals else 50
 
     # Calmness: inverse of power mode ratio + idle ratio
-    power_time = sum(t["power_time_sec"] for t in trips)
-    idle_time = sum(t["idle_duration_sec"] for t in trips)
+    power_time = sum(tr["power_time_sec"] for tr in trips)
+    idle_time = sum(tr["idle_duration_sec"] for tr in trips)
     power_ratio = (power_time / total_dur * 100) if total_dur > 0 else 0
     idle_ratio = (idle_time / total_dur * 100) if total_dur > 0 else 0
     calmness = max(0, min(100, 100 - (power_ratio * 3 + idle_ratio)))
@@ -554,47 +612,47 @@ def compute_driving_profile(trips: list[dict]) -> dict:
     ]
 
     # --- Classification ---
-    highway_dist = sum(t["highway_distance_m"] / 1000 for t in trips)
+    highway_dist = sum(tr["highway_distance_m"] / 1000 for tr in trips)
     highway_pct = (highway_dist / total_dist * 100) if total_dist > 0 else 0
-    avg_speeds = [t["avg_speed_kmh"] for t in trips if t.get("avg_speed_kmh") and t["avg_speed_kmh"] > 0]
+    avg_speeds = [tr["avg_speed_kmh"] for tr in trips if tr.get("avg_speed_kmh") and tr["avg_speed_kmh"] > 0]
     avg_speed = sum(avg_speeds) / len(avg_speeds) if avg_speeds else 0
     avg_trip_km = total_dist / len(trips) if trips else 0
 
     if eco_consciousness >= 70 and smoothness >= 70 and speed_discipline >= 80:
         classification = {
-            "label": "Eco Expert",
-            "description": "You maximize electric driving, maintain smooth inputs, and respect speed limits. Your driving style prioritizes efficiency above all."
+            "label": t["class_eco_expert"] if t else "Eco Expert",
+            "description": t["class_eco_expert_desc"] if t else "You maximize electric driving, maintain smooth inputs, and respect speed limits. Your driving style prioritizes efficiency above all."
         }
     elif calmness < 40 or speed_discipline < 50:
         classification = {
-            "label": "Spirited Driver",
-            "description": "You enjoy dynamic driving with frequent use of power mode and higher speeds. You prioritize engagement over efficiency."
+            "label": t["class_spirited"] if t else "Spirited Driver",
+            "description": t["class_spirited_desc"] if t else "You enjoy dynamic driving with frequent use of power mode and higher speeds. You prioritize engagement over efficiency."
         }
     elif highway_pct > 50 and avg_speed > 60:
         classification = {
-            "label": "Highway Warrior",
-            "description": "Most of your driving happens on highways at higher speeds. You cover long distances efficiently on motorways."
+            "label": t["class_highway_warrior"] if t else "Highway Warrior",
+            "description": t["class_highway_warrior_desc"] if t else "Most of your driving happens on highways at higher speeds. You cover long distances efficiently on motorways."
         }
     elif highway_pct < 20 and avg_trip_km < 15:
         classification = {
-            "label": "City Navigator",
-            "description": "Your trips are predominantly urban and short. You navigate city traffic frequently, ideal for electric and hybrid powertrains."
+            "label": t["class_city_navigator"] if t else "City Navigator",
+            "description": t["class_city_navigator_desc"] if t else "Your trips are predominantly urban and short. You navigate city traffic frequently, ideal for electric and hybrid powertrains."
         }
     elif smoothness >= 75 and consistency >= 70 and calmness >= 65:
         classification = {
-            "label": "Smooth Cruiser",
-            "description": "You drive with consistent, smooth inputs and maintain a calm driving style. Your predictable driving is easy on passengers and the car."
+            "label": t["class_smooth_cruiser"] if t else "Smooth Cruiser",
+            "description": t["class_smooth_cruiser_desc"] if t else "You drive with consistent, smooth inputs and maintain a calm driving style. Your predictable driving is easy on passengers and the car."
         }
     else:
         classification = {
-            "label": "Balanced Driver",
-            "description": "You have a well-rounded driving style that adapts to different conditions. A mix of city and highway driving with moderate efficiency."
+            "label": t["class_balanced"] if t else "Balanced Driver",
+            "description": t["class_balanced_desc"] if t else "You have a well-rounded driving style that adapts to different conditions. A mix of city and highway driving with moderate efficiency."
         }
 
     # --- Speed profile histogram (6 buckets) ---
     speed_buckets = {"0-30": 0, "30-50": 0, "50-70": 0, "70-90": 0, "90-110": 0, "110+": 0}
-    for t in trips:
-        spd = t.get("avg_speed_kmh")
+    for tr in trips:
+        spd = tr.get("avg_speed_kmh")
         if spd is None or spd <= 0:
             continue
         if spd < 30:
@@ -615,8 +673,8 @@ def compute_driving_profile(trips: list[dict]) -> dict:
 
     # --- Trip distance distribution (6 buckets) ---
     dist_buckets = {"0-5 km": 0, "5-15 km": 0, "15-30 km": 0, "30-60 km": 0, "60-100 km": 0, "100+ km": 0}
-    for t in trips:
-        d = t["distance_km"]
+    for tr in trips:
+        d = tr["distance_km"]
         if d < 5:
             dist_buckets["0-5 km"] += 1
         elif d < 15:
@@ -631,8 +689,8 @@ def compute_driving_profile(trips: list[dict]) -> dict:
             dist_buckets["100+ km"] += 1
 
     # --- Driving habits ---
-    night_count = sum(1 for t in trips if t.get("night_trip") == 1)
-    weekend_count = sum(1 for t in trips if t["start"].weekday() >= 5)
+    night_count = sum(1 for tr in trips if tr.get("night_trip") == 1)
+    weekend_count = sum(1 for tr in trips if tr["start"].weekday() >= 5)
     night_pct = round(night_count / len(trips) * 100, 1) if trips else 0
     weekend_pct = round(weekend_count / len(trips) * 100, 1) if trips else 0
 
@@ -645,14 +703,22 @@ def compute_driving_profile(trips: list[dict]) -> dict:
         trips_per_day = 0
 
     hour_counts = [0] * 24
-    for t in trips:
-        hour_counts[t["start"].hour] += 1
+    for tr in trips:
+        hour_counts[tr["start"].hour] += 1
     peak_hour_idx = hour_counts.index(max(hour_counts))
     peak_hour = f"{peak_hour_idx:02d}:00"
 
+    radar_labels = [
+        t["radar_smoothness"] if t else "Smoothness",
+        t["radar_eco"] if t else "Eco-Consciousness",
+        t["radar_speed_discipline"] if t else "Speed Discipline",
+        t["radar_consistency"] if t else "Consistency",
+        t["radar_calmness"] if t else "Calmness",
+    ]
+
     return {
         "radar": {
-            "labels": ["Smoothness", "Eco-Consciousness", "Speed Discipline", "Consistency", "Calmness"],
+            "labels": radar_labels,
             "values": radar_values,
         },
         "classification": classification,
@@ -677,16 +743,16 @@ def compute_driving_profile(trips: list[dict]) -> dict:
     }
 
 
-def compute_engine_recommendation(trips: list[dict], profile: dict) -> dict:
+def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | None = None) -> dict:
     """Score 5 engine types based on driving patterns and recommend the best fit."""
     if not trips:
         return {"scores": [], "recommendation": None, "runner_up": None}
 
-    total_dist = sum(t["distance_km"] for t in trips)
-    total_dur = sum(t["duration_sec"] for t in trips)
-    ev_dist = sum(t["ev_distance_km"] for t in trips)
-    highway_dist = sum(t["highway_distance_m"] / 1000 for t in trips)
-    total_fuel = sum(t["fuel_ml"] for t in trips)
+    total_dist = sum(tr["distance_km"] for tr in trips)
+    total_dur = sum(tr["duration_sec"] for tr in trips)
+    ev_dist = sum(tr["ev_distance_km"] for tr in trips)
+    highway_dist = sum(tr["highway_distance_m"] / 1000 for tr in trips)
+    total_fuel = sum(tr["fuel_ml"] for tr in trips)
 
     highway_pct = (highway_dist / total_dist * 100) if total_dist > 0 else 0
     city_pct = 100 - highway_pct
@@ -694,7 +760,7 @@ def compute_engine_recommendation(trips: list[dict], profile: dict) -> dict:
     avg_trip_km = total_dist / len(trips) if trips else 0
     avg_fuel = (total_fuel / total_dist * 100) if total_dist > 0 else 0
 
-    short_trips = sum(1 for t in trips if t["distance_km"] < 15)
+    short_trips = sum(1 for tr in trips if tr["distance_km"] < 15)
     short_trip_pct = (short_trips / len(trips) * 100) if trips else 0
 
     radar = profile.get("radar", {}).get("values", [50, 50, 50, 50, 50])
@@ -703,11 +769,11 @@ def compute_engine_recommendation(trips: list[dict], profile: dict) -> dict:
     calmness = radar[4] if len(radar) > 4 else 50
 
     engines = {
-        "BEV": {"label": "Battery Electric", "icon": "battery-full"},
-        "PHEV": {"label": "Plug-in Hybrid", "icon": "plug"},
-        "HEV": {"label": "Hybrid", "icon": "leaf"},
-        "Petrol": {"label": "Petrol", "icon": "gas-pump"},
-        "Diesel": {"label": "Diesel", "icon": "oil-can"},
+        "BEV": {"label": t["engine_bev"] if t else "Battery Electric", "icon": "battery-full"},
+        "PHEV": {"label": t["engine_phev"] if t else "Plug-in Hybrid", "icon": "plug"},
+        "HEV": {"label": t["engine_hev"] if t else "Hybrid", "icon": "leaf"},
+        "Petrol": {"label": t["engine_petrol"] if t else "Petrol", "icon": "gas-pump"},
+        "Diesel": {"label": t["engine_diesel"] if t else "Diesel", "icon": "oil-can"},
     }
 
     scores = {}
@@ -789,49 +855,49 @@ def compute_engine_recommendation(trips: list[dict], profile: dict) -> dict:
     }
 
     if short_trip_pct > 50:
-        reasons_map["BEV"].append(f"{short_trip_pct:.0f}% of your trips are under 15 km — perfect for battery range")
-        reasons_map["PHEV"].append(f"{short_trip_pct:.0f}% short trips can run on pure electric")
+        reasons_map["BEV"].append((t["reason_bev_short_trips"] if t else "{pct:.0f}% of your trips are under 15 km — perfect for battery range").format(pct=short_trip_pct))
+        reasons_map["PHEV"].append((t["reason_phev_short_trips"] if t else "{pct:.0f}% short trips can run on pure electric").format(pct=short_trip_pct))
     if city_pct > 60:
-        reasons_map["BEV"].append(f"{city_pct:.0f}% city driving maximizes regenerative braking")
-        reasons_map["HEV"].append(f"{city_pct:.0f}% city driving is where hybrids shine most")
-        reasons_map["PHEV"].append(f"{city_pct:.0f}% city driving enables frequent EV mode")
+        reasons_map["BEV"].append((t["reason_bev_city"] if t else "{pct:.0f}% city driving maximizes regenerative braking").format(pct=city_pct))
+        reasons_map["HEV"].append((t["reason_hev_city"] if t else "{pct:.0f}% city driving is where hybrids shine most").format(pct=city_pct))
+        reasons_map["PHEV"].append((t["reason_phev_city"] if t else "{pct:.0f}% city driving enables frequent EV mode").format(pct=city_pct))
     if ev_pct > 20:
-        reasons_map["BEV"].append(f"Already {ev_pct:.0f}% EV driving shows readiness for full electric")
-        reasons_map["PHEV"].append(f"Your {ev_pct:.0f}% EV usage would increase with a larger battery")
+        reasons_map["BEV"].append((t["reason_bev_ev_ready"] if t else "Already {pct:.0f}% EV driving shows readiness for full electric").format(pct=ev_pct))
+        reasons_map["PHEV"].append((t["reason_phev_ev_usage"] if t else "Your {pct:.0f}% EV usage would increase with a larger battery").format(pct=ev_pct))
     if eco_score >= 60:
-        reasons_map["BEV"].append("Your eco-conscious style maximizes EV efficiency")
-        reasons_map["HEV"].append("Your eco-conscious driving optimizes hybrid regeneration")
+        reasons_map["BEV"].append(t["reason_bev_eco_style"] if t else "Your eco-conscious style maximizes EV efficiency")
+        reasons_map["HEV"].append(t["reason_hev_eco_style"] if t else "Your eco-conscious driving optimizes hybrid regeneration")
     if avg_trip_km > 60:
-        reasons_map["Diesel"].append(f"Average trip of {avg_trip_km:.0f} km favors diesel efficiency at cruise")
-        reasons_map["Petrol"].append(f"Your {avg_trip_km:.0f} km average trip suits petrol's highway comfort")
+        reasons_map["Diesel"].append((t["reason_diesel_long_trip"] if t else "Average trip of {km:.0f} km favors diesel efficiency at cruise").format(km=avg_trip_km))
+        reasons_map["Petrol"].append((t["reason_petrol_long_trip"] if t else "Your {km:.0f} km average trip suits petrol's highway comfort").format(km=avg_trip_km))
     if highway_pct > 50:
-        reasons_map["Diesel"].append(f"{highway_pct:.0f}% highway driving is diesel's sweet spot")
-        reasons_map["Petrol"].append(f"{highway_pct:.0f}% highway driving suits petrol turbo engines")
+        reasons_map["Diesel"].append((t["reason_diesel_highway"] if t else "{pct:.0f}% highway driving is diesel's sweet spot").format(pct=highway_pct))
+        reasons_map["Petrol"].append((t["reason_petrol_highway"] if t else "{pct:.0f}% highway driving suits petrol turbo engines").format(pct=highway_pct))
     if calmness < 40:
-        reasons_map["Petrol"].append("Your spirited driving style pairs well with responsive petrol engines")
+        reasons_map["Petrol"].append(t["reason_petrol_spirited"] if t else "Your spirited driving style pairs well with responsive petrol engines")
     if avg_fuel > 6:
-        reasons_map["HEV"].append(f"At {avg_fuel:.1f} L/100km, a hybrid could cut consumption by 20-30%")
-        reasons_map["PHEV"].append(f"At {avg_fuel:.1f} L/100km, a PHEV could slash your fuel costs")
+        reasons_map["HEV"].append((t["reason_hev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a hybrid could cut consumption by 20-30%").format(fuel=avg_fuel))
+        reasons_map["PHEV"].append((t["reason_phev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a PHEV could slash your fuel costs").format(fuel=avg_fuel))
 
     # Fallback reasons
     if not reasons_map["BEV"]:
-        reasons_map["BEV"] = ["Zero emissions and lowest running costs", "Best for daily commutes and urban driving"]
+        reasons_map["BEV"] = [t["reason_bev_fallback_1"] if t else "Zero emissions and lowest running costs", t["reason_bev_fallback_2"] if t else "Best for daily commutes and urban driving"]
     if not reasons_map["PHEV"]:
-        reasons_map["PHEV"] = ["Flexibility of electric for short trips with petrol backup", "Good balance of efficiency and range"]
+        reasons_map["PHEV"] = [t["reason_phev_fallback_1"] if t else "Flexibility of electric for short trips with petrol backup", t["reason_phev_fallback_2"] if t else "Good balance of efficiency and range"]
     if not reasons_map["HEV"]:
-        reasons_map["HEV"] = ["No charging needed with self-charging hybrid system", "Great fuel efficiency in mixed driving"]
+        reasons_map["HEV"] = [t["reason_hev_fallback_1"] if t else "No charging needed with self-charging hybrid system", t["reason_hev_fallback_2"] if t else "Great fuel efficiency in mixed driving"]
     if not reasons_map["Petrol"]:
-        reasons_map["Petrol"] = ["Wide availability and lower purchase price", "Good for varied driving conditions"]
+        reasons_map["Petrol"] = [t["reason_petrol_fallback_1"] if t else "Wide availability and lower purchase price", t["reason_petrol_fallback_2"] if t else "Good for varied driving conditions"]
     if not reasons_map["Diesel"]:
-        reasons_map["Diesel"] = ["Best highway fuel economy for long distances", "High torque for heavy loads"]
+        reasons_map["Diesel"] = [t["reason_diesel_fallback_1"] if t else "Best highway fuel economy for long distances", t["reason_diesel_fallback_2"] if t else "High torque for heavy loads"]
 
     # Tradeoffs
     tradeoffs_map = {
-        "BEV": "Requires charging infrastructure; range limited on long highway trips",
-        "PHEV": "Higher purchase price; needs regular charging to maximize savings",
-        "HEV": "Less electric range than PHEV/BEV; still burns fuel for all trips",
-        "Petrol": "Higher fuel costs; more CO2 emissions than electrified options",
-        "Diesel": "Higher emissions in city; declining resale value in some markets",
+        "BEV": t["tradeoff_bev"] if t else "Requires charging infrastructure; range limited on long highway trips",
+        "PHEV": t["tradeoff_phev"] if t else "Higher purchase price; needs regular charging to maximize savings",
+        "HEV": t["tradeoff_hev"] if t else "Less electric range than PHEV/BEV; still burns fuel for all trips",
+        "Petrol": t["tradeoff_petrol"] if t else "Higher fuel costs; more CO2 emissions than electrified options",
+        "Diesel": t["tradeoff_diesel"] if t else "Higher emissions in city; declining resale value in some markets",
     }
 
     result_scores = []
@@ -866,7 +932,7 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
                highway_city, night_driving, idle_trend, service_history, odometer_data,
                driving_profile=None, engine_recommendation=None,
                vehicle=None, currency_code="PLN", currency_symbol="zl",
-               country_code="PL", fuel_type="gasoline"):
+               country_code="PL", fuel_type="gasoline", t=None, lang="en"):
     vehicle = vehicle or {"alias": "My Car", "brand": ""}
     vehicle_name = vehicle["alias"]
     lats = [t["start_lat"] for t in trips if t["start_lat"] is not None]
@@ -887,6 +953,12 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
             })
 
     countries_str = ", ".join(kpis["countries_list"]) if kpis["countries_list"] else "N/A"
+
+    # Build JS translation subset (js_* keys + a few extras needed in chart labels)
+    js_t = {k[3:]: v for k, v in (t or {}).items() if k.startswith("js_")}
+    for extra_key in ("night", "day", "highway", "city_other", "best_match", "runner_up", "tradeoffs_label"):
+        if t and extra_key in t:
+            js_t[extra_key] = t[extra_key]
 
     data = {
         "kpis": kpis,
@@ -912,11 +984,11 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
     }
 
     html = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="{lang}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{vehicle_name} Trip Dashboard</title>
+<title>{vehicle_name} — {t["dashboard_subtitle"]}</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
@@ -1016,7 +1088,7 @@ tailwind.config = {{
   <div class="flex items-center justify-between mb-8">
     <div>
       <h1 class="text-3xl font-bold text-heading tracking-tight">{vehicle_name}</h1>
-      <p class="text-muted mt-1">Trip Analytics Dashboard &middot; Hybrid</p>
+      <p class="text-muted mt-1">{t["dashboard_subtitle"]} &middot; {t["hybrid"]}</p>
     </div>
     <div class="flex items-center gap-4">
       <button id="themeToggle" onclick="applyTheme(!isDarkMode())" class="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors" title="Toggle theme">
@@ -1029,7 +1101,7 @@ tailwind.config = {{
       </button>
       <div class="text-right text-sm text-faint">
         <div>{kpis['first_trip']} &mdash; {kpis['last_trip']}</div>
-        <div>{kpis['total_trips']} trips recorded</div>
+        <div>{kpis['total_trips']} {t["trips_recorded"]}</div>
       </div>
     </div>
   </div>
@@ -1038,27 +1110,27 @@ tailwind.config = {{
   <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
     <div class="card">
       <div class="kpi-value">{kpis['total_trips']}</div>
-      <div class="kpi-label">Total Trips</div>
+      <div class="kpi-label">{t["kpi_total_trips"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['total_distance_km']:,.0f}<span class="text-lg text-muted"> km</span></div>
-      <div class="kpi-label">Total Distance</div>
+      <div class="kpi-label">{t["kpi_total_distance"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['avg_fuel_l100km']}<span class="text-lg text-muted"> L/100</span></div>
-      <div class="kpi-label">Avg Fuel Consumption</div>
+      <div class="kpi-label">{t["kpi_avg_fuel"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['ev_ratio_pct']}<span class="text-lg text-muted">%</span></div>
-      <div class="kpi-label">Electric Driving</div>
+      <div class="kpi-label">{t["kpi_electric_driving"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['avg_score']}</div>
-      <div class="kpi-label">Avg Driving Score</div>
+      <div class="kpi-label">{t["kpi_avg_score"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['total_hours']:,.0f}<span class="text-lg text-muted"> h</span></div>
-      <div class="kpi-label">Time Driving</div>
+      <div class="kpi-label">{t["kpi_time_driving"]}</div>
     </div>
   </div>
 
@@ -1066,27 +1138,27 @@ tailwind.config = {{
   <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
     <div class="card">
       <div class="kpi-value">{kpis['total_cost']:,.0f}<span class="text-lg text-muted"> {currency_code}</span></div>
-      <div class="kpi-label">Total Fuel Cost</div>
+      <div class="kpi-label">{t["kpi_total_fuel_cost"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['cost_per_km']}<span class="text-lg text-muted"> {currency_code}/km</span></div>
-      <div class="kpi-label">Cost per km</div>
+      <div class="kpi-label">{t["kpi_cost_per_km"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['total_fuel_l']:,.0f}<span class="text-lg text-muted"> L</span></div>
-      <div class="kpi-label">Total Fuel Used</div>
+      <div class="kpi-label">{t["kpi_total_fuel_used"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['total_ev_km']:,.0f}<span class="text-lg text-muted"> km</span></div>
-      <div class="kpi-label">EV Distance</div>
+      <div class="kpi-label">{t["kpi_ev_distance"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['co2_emitted_kg']:,.0f}<span class="text-lg text-muted"> kg</span></div>
-      <div class="kpi-label">CO2 Emitted</div>
+      <div class="kpi-label">{t["kpi_co2_emitted"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value" style="color:#22c55e">{kpis['co2_saved_kg']:,.0f}<span class="text-lg text-muted"> kg</span></div>
-      <div class="kpi-label">CO2 Saved by EV</div>
+      <div class="kpi-label">{t["kpi_co2_saved"]}</div>
     </div>
   </div>
 
@@ -1094,37 +1166,37 @@ tailwind.config = {{
   <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
     <div class="card">
       <div class="kpi-value">{kpis['avg_speed_kmh']}<span class="text-lg text-muted"> km/h</span></div>
-      <div class="kpi-label">Avg Speed</div>
+      <div class="kpi-label">{t["kpi_avg_speed"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['max_speed_ever']}<span class="text-lg text-muted"> km/h</span></div>
-      <div class="kpi-label">Max Speed</div>
+      <div class="kpi-label">{t["kpi_max_speed"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['highway_pct']}<span class="text-lg text-muted">%</span></div>
-      <div class="kpi-label">Highway Distance</div>
+      <div class="kpi-label">{t["kpi_highway_distance"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['idle_pct']}<span class="text-lg text-muted">%</span></div>
-      <div class="kpi-label">Idle Time</div>
+      <div class="kpi-label">{t["kpi_idle_time"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['night_trip_count']}</div>
-      <div class="kpi-label">Night Trips</div>
+      <div class="kpi-label">{t["kpi_night_trips"]}</div>
     </div>
     <div class="card">
       <div class="kpi-value">{kpis['countries_visited']}</div>
-      <div class="kpi-label">Countries <span class="text-xs text-faint">({countries_str})</span></div>
+      <div class="kpi-label">{t["kpi_countries"]} <span class="text-xs text-faint">({countries_str})</span></div>
     </div>
   </div>
 
   <!-- Tab Navigation -->
   <div class="flex gap-2 mb-8 flex-wrap" id="tabBar">
-    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium bg-lexus-600 text-white transition-colors" data-tab="overview" onclick="switchTab('overview')">Overview</button>
-    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="fuel-ev" onclick="switchTab('fuel-ev')">Fuel &amp; EV</button>
-    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="driving" onclick="switchTab('driving')">Driving</button>
-    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="trips" onclick="switchTab('trips')">Trips</button>
-    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="profile" onclick="switchTab('profile')">Profile</button>
+    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium bg-lexus-600 text-white transition-colors" data-tab="overview" onclick="switchTab('overview')">{t["tab_overview"]}</button>
+    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="fuel-ev" onclick="switchTab('fuel-ev')">{t["tab_fuel_ev"]}</button>
+    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="driving" onclick="switchTab('driving')">{t["tab_driving"]}</button>
+    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="trips" onclick="switchTab('trips')">{t["tab_trips"]}</button>
+    <button class="tab-btn px-4 py-2 rounded-full text-sm font-medium heat-btn-inactive transition-colors" data-tab="profile" onclick="switchTab('profile')">{t["tab_profile"]}</button>
   </div>
 
   <div id="tab-overview" data-tabpanel>
@@ -1132,14 +1204,14 @@ tailwind.config = {{
   <div class="card mb-8 !p-0 overflow-hidden">
     <div class="p-6 pb-2 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
       <div>
-        <h2 class="text-xl font-semibold text-heading">Route Heatmap</h2>
-        <p class="text-sm text-muted">All {kpis['total_trips']} trips overlaid &middot; brighter = more frequent &middot; <span id="heatmapPts"></span> waypoints</p>
+        <h2 class="text-xl font-semibold text-heading">{t["heatmap_title"]}</h2>
+        <p class="text-sm text-muted">{kpis['total_trips']} {t["heatmap_desc_prefix"]} &middot; {t["heatmap_desc_suffix"]} &middot; <span id="heatmapPts"></span> {t["heatmap_waypoints"]}</p>
       </div>
       <div class="flex gap-2 flex-wrap">
-        <button class="heat-btn px-3 py-1 rounded-full text-sm text-white bg-lexus-600 transition-colors" data-layer="all" onclick="switchHeatLayer('all')">All</button>
-        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="ev" onclick="switchHeatLayer('ev')">EV</button>
-        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="highway" onclick="switchHeatLayer('highway')">Highway</button>
-        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="overspeed" onclick="switchHeatLayer('overspeed')">Over Limit</button>
+        <button class="heat-btn px-3 py-1 rounded-full text-sm text-white bg-lexus-600 transition-colors" data-layer="all" onclick="switchHeatLayer('all')">{t["heatmap_all"]}</button>
+        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="ev" onclick="switchHeatLayer('ev')">{t["heatmap_ev"]}</button>
+        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="highway" onclick="switchHeatLayer('highway')">{t["heatmap_highway"]}</button>
+        <button class="heat-btn px-3 py-1 rounded-full text-sm heat-btn-inactive transition-colors" data-layer="overspeed" onclick="switchHeatLayer('overspeed')">{t["heatmap_over_limit"]}</button>
       </div>
     </div>
     <div id="heatmap"></div>
@@ -1148,18 +1220,18 @@ tailwind.config = {{
   <!-- Monthly Charts Row -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Monthly Distance</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["monthly_distance"]}</h3>
       <canvas id="monthlyDistance"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Monthly Fuel Cost ({currency_code})</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["monthly_fuel_cost"]} ({currency_code})</h3>
       <canvas id="monthlyCost"></canvas>
     </div>
   </div>
 
   <!-- Fuel Efficiency Trend -->
   <div class="card mb-8">
-    <h3 class="text-lg font-semibold text-heading mb-4">Fuel Efficiency Trend (20-trip rolling avg, L/100km)</h3>
+    <h3 class="text-lg font-semibold text-heading mb-4">{t["fuel_efficiency_trend"]}</h3>
     <div style="height:200px"><canvas id="fuelTrend"></canvas></div>
   </div>
   </div><!-- /tab-overview -->
@@ -1168,11 +1240,11 @@ tailwind.config = {{
   <!-- Fuel + EV Row -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Monthly Fuel Consumption (L/100km)</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["monthly_fuel_consumption"]}</h3>
       <canvas id="monthlyFuel"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Electric vs Fuel Distance by Month</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["ev_vs_fuel_distance"]}</h3>
       <canvas id="evIce"></canvas>
     </div>
   </div>
@@ -1180,29 +1252,29 @@ tailwind.config = {{
   <!-- Doughnut Charts Row -->
   <div class="grid grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Drive Mode Time (h)</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["drive_mode_time"]}</h3>
       <canvas id="modeTime"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Drive Mode Distance (km)</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["drive_mode_distance"]}</h3>
       <canvas id="modeDist"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Night vs Day</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["night_vs_day"]}</h3>
       <canvas id="nightDay"></canvas>
       <div class="grid grid-cols-2 gap-2 mt-3 text-xs">
         <div class="text-center">
-          <div class="text-muted">Night</div>
+          <div class="text-muted">{t["night"]}</div>
           <div class="text-heading font-semibold" id="nightFuel"></div>
         </div>
         <div class="text-center">
-          <div class="text-muted">Day</div>
+          <div class="text-muted">{t["day"]}</div>
           <div class="text-heading font-semibold" id="dayFuel"></div>
         </div>
       </div>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Trip Categories</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["trip_categories_title"]}</h3>
       <canvas id="tripCats"></canvas>
     </div>
   </div>
@@ -1210,11 +1282,11 @@ tailwind.config = {{
   <!-- Seasonal Charts -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">EV Ratio by Season</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["ev_ratio_by_season"]}</h3>
       <canvas id="seasonalEv"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Fuel by Season (L/100km)</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["fuel_by_season"]}</h3>
       <canvas id="seasonalFuel"></canvas>
     </div>
   </div>
@@ -1224,11 +1296,11 @@ tailwind.config = {{
   <!-- Speed Analytics -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Max Speed Distribution</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["max_speed_distribution"]}</h3>
       <canvas id="speedHist"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Monthly Speed Trends</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["monthly_speed_trends"]}</h3>
       <canvas id="speedTrend"></canvas>
     </div>
   </div>
@@ -1236,11 +1308,11 @@ tailwind.config = {{
   <!-- Highway vs City -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Highway vs City (km/month)</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["highway_vs_city"]}</h3>
       <canvas id="highwayCity"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Idle Time Trend (%)</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["idle_time_trend"]}</h3>
       <canvas id="idleTrend"></canvas>
     </div>
   </div>
@@ -1248,11 +1320,11 @@ tailwind.config = {{
   <!-- Score Charts -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Monthly Driving Score (Toyota app)</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["monthly_driving_score"]}</h3>
       <canvas id="monthlyScore"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-sm font-semibold text-heading mb-3">Driving Score Distribution</h3>
+      <h3 class="text-sm font-semibold text-heading mb-3">{t["driving_score_distribution"]}</h3>
       <canvas id="scoreDist"></canvas>
     </div>
   </div>
@@ -1260,11 +1332,11 @@ tailwind.config = {{
   <!-- Time Patterns Row -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Trips by Day of Week</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["trips_by_weekday"]}</h3>
       <canvas id="weekday"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Trips by Hour of Day</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["trips_by_hour"]}</h3>
       <canvas id="hourly"></canvas>
     </div>
   </div>
@@ -1272,20 +1344,24 @@ tailwind.config = {{
   </div><!-- /tab-driving -->
 
   <div id="tab-trips" data-tabpanel style="display:none">
-  <!-- Top Trips Table -->
+  <!-- Top Journeys Table -->
   <div class="card mb-8 overflow-x-auto">
-    <h3 class="text-lg font-semibold text-heading mb-4">Longest Trips</h3>
+    <div class="flex items-baseline gap-3 mb-4">
+      <h3 class="text-lg font-semibold text-heading">{t["longest_journeys"]}</h3>
+      <span class="text-xs text-muted">{t["longest_journeys_desc"]}</span>
+    </div>
     <table class="w-full text-sm">
       <thead>
         <tr class="text-muted border-b border-themed">
-          <th class="text-left py-2 px-3">Date</th>
-          <th class="text-right py-2 px-3">Distance (km)</th>
-          <th class="text-right py-2 px-3">Duration (min)</th>
-          <th class="text-right py-2 px-3">Fuel (L)</th>
-          <th class="text-right py-2 px-3">Cost ({currency_code})</th>
-          <th class="text-right py-2 px-3">EV %</th>
-          <th class="text-right py-2 px-3">Max km/h</th>
-          <th class="text-right py-2 px-3">Score</th>
+          <th class="text-left py-2 px-3">{t["th_date"]}</th>
+          <th class="text-right py-2 px-3">{t["th_distance_km"]}</th>
+          <th class="text-right py-2 px-3">{t["th_drive_time"]}</th>
+          <th class="text-right py-2 px-3">{t["th_total_time"]}</th>
+          <th class="text-right py-2 px-3">{t["th_stops"]}</th>
+          <th class="text-right py-2 px-3">{t["th_fuel_l"]}</th>
+          <th class="text-right py-2 px-3">{t["th_avg_l100km"]}</th>
+          <th class="text-right py-2 px-3">{t["th_cost"]} ({currency_code})</th>
+          <th class="text-right py-2 px-3">{t["th_max_kmh"]}</th>
         </tr>
       </thead>
       <tbody id="topTripsBody"></tbody>
@@ -1294,15 +1370,15 @@ tailwind.config = {{
 
   <!-- Service History -->
   <div class="card mb-8 overflow-x-auto" id="serviceSection" style="display:none">
-    <h3 class="text-lg font-semibold text-heading mb-4">Service History</h3>
+    <h3 class="text-lg font-semibold text-heading mb-4">{t["service_history"]}</h3>
     <table class="w-full text-sm">
       <thead>
         <tr class="text-muted border-b border-themed">
-          <th class="text-left py-2 px-3">Date</th>
-          <th class="text-left py-2 px-3">Category</th>
-          <th class="text-left py-2 px-3">Provider</th>
-          <th class="text-right py-2 px-3">Odometer (km)</th>
-          <th class="text-left py-2 px-3">Notes</th>
+          <th class="text-left py-2 px-3">{t["th_date"]}</th>
+          <th class="text-left py-2 px-3">{t["th_category"]}</th>
+          <th class="text-left py-2 px-3">{t["th_provider"]}</th>
+          <th class="text-right py-2 px-3">{t["th_odometer_km"]}</th>
+          <th class="text-left py-2 px-3">{t["th_notes"]}</th>
         </tr>
       </thead>
       <tbody id="serviceBody"></tbody>
@@ -1311,7 +1387,7 @@ tailwind.config = {{
 
   <!-- Odometer Tracking -->
   <div class="card mb-8" id="odometerSection" style="display:none">
-    <h3 class="text-lg font-semibold text-heading mb-4">Odometer Tracking</h3>
+    <h3 class="text-lg font-semibold text-heading mb-4">{t["odometer_tracking"]}</h3>
     <canvas id="odometerChart"></canvas>
   </div>
   </div><!-- /tab-trips -->
@@ -1326,7 +1402,7 @@ tailwind.config = {{
       <p class="text-muted text-sm leading-relaxed" id="profileDesc"></p>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Driving Style Radar</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["driving_style_radar"]}</h3>
       <div style="max-width:360px;margin:0 auto"><canvas id="radarChart"></canvas></div>
     </div>
   </div>
@@ -1334,20 +1410,20 @@ tailwind.config = {{
   <!-- Speed Profile + Road Type -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Speed Profile (avg speed per trip)</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["speed_profile_title"]}</h3>
       <canvas id="speedProfileChart"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Road Type Split</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["road_type_split"]}</h3>
       <div style="max-width:280px;margin:0 auto"><canvas id="roadTypeChart"></canvas></div>
       <div class="grid grid-cols-2 gap-4 mt-4 text-center text-sm">
         <div>
           <div class="text-2xl font-bold text-heading" id="highwayPctVal"></div>
-          <div class="text-muted">Highway</div>
+          <div class="text-muted">{t["highway"]}</div>
         </div>
         <div>
           <div class="text-2xl font-bold text-heading" id="cityPctVal"></div>
-          <div class="text-muted">City / Other</div>
+          <div class="text-muted">{t["city_other"]}</div>
         </div>
       </div>
     </div>
@@ -1356,27 +1432,27 @@ tailwind.config = {{
   <!-- Trip Distance Distribution + Habits -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Trip Distance Distribution</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["trip_distance_distribution"]}</h3>
       <canvas id="tripDistChart"></canvas>
     </div>
     <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">Driving Habits</h3>
+      <h3 class="text-lg font-semibold text-heading mb-4">{t["driving_habits"]}</h3>
       <div class="grid grid-cols-2 gap-4 mt-2">
         <div class="rounded-xl p-4" style="background:var(--bg-body)">
           <div class="text-2xl font-bold text-heading" id="habitNight"></div>
-          <div class="text-sm text-muted">Night Driving</div>
+          <div class="text-sm text-muted">{t["habit_night_driving"]}</div>
         </div>
         <div class="rounded-xl p-4" style="background:var(--bg-body)">
           <div class="text-2xl font-bold text-heading" id="habitWeekend"></div>
-          <div class="text-sm text-muted">Weekend Trips</div>
+          <div class="text-sm text-muted">{t["habit_weekend_trips"]}</div>
         </div>
         <div class="rounded-xl p-4" style="background:var(--bg-body)">
           <div class="text-2xl font-bold text-heading" id="habitTripsDay"></div>
-          <div class="text-sm text-muted">Trips / Day</div>
+          <div class="text-sm text-muted">{t["habit_trips_per_day"]}</div>
         </div>
         <div class="rounded-xl p-4" style="background:var(--bg-body)">
           <div class="text-2xl font-bold text-heading" id="habitPeakHour"></div>
-          <div class="text-sm text-muted">Peak Hour</div>
+          <div class="text-sm text-muted">{t["habit_peak_hour"]}</div>
         </div>
       </div>
     </div>
@@ -1384,20 +1460,21 @@ tailwind.config = {{
 
   <!-- Engine Recommendation -->
   <div class="card mb-8">
-    <h3 class="text-lg font-semibold text-heading mb-6">Engine Type Recommendation</h3>
+    <h3 class="text-lg font-semibold text-heading mb-6">{t["engine_type_recommendation"]}</h3>
     <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 mb-8" id="engineScores"></div>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6" id="engineCards"></div>
   </div>
   </div><!-- /tab-profile -->
 
   <footer class="text-center text-xs text-footer py-8">
-    Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; {vehicle_name} Trip Dashboard
-    &middot; Fuel prices: {fuel_type} ({country_code}) in {currency_code}
+    {t["footer_generated"]} {datetime.now().strftime("%Y-%m-%d %H:%M")} &middot; {vehicle_name} — {t["dashboard_subtitle"]}
+    &middot; {t["footer_fuel_prices"]}: {fuel_type} ({country_code}) in {currency_code}
   </footer>
 </div>
 
 <script>
 const D = {json.dumps(data, separators=(',', ':'))};
+const T = {json.dumps(js_t, separators=(',', ':'))};
 
 // --- Theme ---
 function isDarkMode() {{ return document.documentElement.classList.contains('dark'); }}
@@ -1473,12 +1550,12 @@ createChart('monthlyDistance', {{
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'Distance (km)',
+      label: T.distance_km,
       data: D.monthly.distance,
       backgroundColor: 'rgba(14,165,233,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'Trips',
+      label: T.trips,
       data: D.monthly.trips,
       type: 'line',
       borderColor: '#f59e0b',
@@ -1492,8 +1569,8 @@ createChart('monthlyDistance', {{
     responsive: true,
     interaction: {{ mode: 'index', intersect: false }},
     scales: {{
-      y: {{ title: {{ display: true, text: 'km' }}, grid: {{ color: gridColor }} }},
-      y1: {{ position: 'right', title: {{ display: true, text: 'Trips' }}, grid: {{ display: false }} }},
+      y: {{ title: {{ display: true, text: T.km }}, grid: {{ color: gridColor }} }},
+      y1: {{ position: 'right', title: {{ display: true, text: T.trips }}, grid: {{ display: false }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1505,12 +1582,12 @@ createChart('monthlyCost', {{
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'Fuel Cost (' + D.currency.code + ')',
+      label: T.fuel_cost + ' (' + D.currency.code + ')',
       data: D.monthly.fuel_cost,
       backgroundColor: 'rgba(234,179,8,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'Fuel Price (' + D.currency.code + '/L)',
+      label: T.fuel_price + ' (' + D.currency.code + T.per_l + ')',
       data: D.monthly.fuel_price,
       type: 'line',
       borderColor: '#ef4444',
@@ -1525,7 +1602,7 @@ createChart('monthlyCost', {{
     interaction: {{ mode: 'index', intersect: false }},
     scales: {{
       y: {{ title: {{ display: true, text: D.currency.code }}, grid: {{ color: gridColor }} }},
-      y1: {{ position: 'right', title: {{ display: true, text: D.currency.code + '/L' }}, grid: {{ display: false }} }},
+      y1: {{ position: 'right', title: {{ display: true, text: D.currency.code + T.per_l }}, grid: {{ display: false }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1537,7 +1614,7 @@ createChart('monthlyFuel', {{
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'L/100km',
+      label: T.l100km,
       data: D.monthly.avg_fuel,
       borderColor: '#ef4444',
       backgroundColor: 'rgba(239,68,68,0.1)',
@@ -1549,7 +1626,7 @@ createChart('monthlyFuel', {{
   options: {{
     responsive: true,
     scales: {{
-      y: {{ title: {{ display: true, text: 'L/100km' }}, grid: {{ color: gridColor }} }},
+      y: {{ title: {{ display: true, text: T.l100km }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1561,12 +1638,12 @@ createChart('evIce', {{
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'Electric (km)',
+      label: T.electric_km,
       data: D.monthly.ev_distance,
       backgroundColor: 'rgba(34,197,94,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'Fuel (km)',
+      label: T.fuel_km,
       data: D.monthly.distance.map((d,i) => Math.max(0, +(d - D.monthly.ev_distance[i]).toFixed(1))),
       backgroundColor: 'rgba(239,68,68,0.5)',
       borderRadius: 6,
@@ -1576,7 +1653,7 @@ createChart('evIce', {{
     responsive: true,
     scales: {{
       x: {{ stacked: true, grid: {{ display: false }} }},
-      y: {{ stacked: true, title: {{ display: true, text: 'km' }}, grid: {{ color: gridColor }} }}
+      y: {{ stacked: true, title: {{ display: true, text: T.km }}, grid: {{ color: gridColor }} }}
     }}
   }}
 }});
@@ -1627,7 +1704,7 @@ createChart('speedHist', {{
   data: {{
     labels: D.speedAnalytics.hist_labels,
     datasets: [{{
-      label: 'Trips',
+      label: T.trips,
       data: D.speedAnalytics.hist_counts,
       backgroundColor: 'rgba(14,165,233,0.7)',
       borderRadius: 4,
@@ -1637,8 +1714,8 @@ createChart('speedHist', {{
     responsive: true,
     plugins: {{ legend: {{ display: false }} }},
     scales: {{
-      y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
-      x: {{ title: {{ display: true, text: 'Max Speed (km/h)' }}, grid: {{ display: false }} }}
+      y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
+      x: {{ title: {{ display: true, text: T.max_speed_kmh }}, grid: {{ display: false }} }}
     }}
   }}
 }});
@@ -1649,7 +1726,7 @@ createChart('speedTrend', {{
   data: {{
     labels: D.speedAnalytics.monthly_labels,
     datasets: [{{
-      label: 'Avg Speed (km/h)',
+      label: T.avg_speed_kmh,
       data: D.speedAnalytics.monthly_avg,
       borderColor: '#0ea5e9',
       backgroundColor: 'rgba(14,165,233,0.1)',
@@ -1657,7 +1734,7 @@ createChart('speedTrend', {{
       tension: 0.3,
       pointRadius: 4,
     }}, {{
-      label: 'Max Speed (km/h)',
+      label: T.max_speed_kmh,
       data: D.speedAnalytics.monthly_max,
       borderColor: '#ef4444',
       backgroundColor: 'transparent',
@@ -1670,7 +1747,7 @@ createChart('speedTrend', {{
     responsive: true,
     interaction: {{ mode: 'index', intersect: false }},
     scales: {{
-      y: {{ title: {{ display: true, text: 'km/h' }}, grid: {{ color: gridColor }} }},
+      y: {{ title: {{ display: true, text: T.kmh }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1682,12 +1759,12 @@ createChart('highwayCity', {{
   data: {{
     labels: D.highwayCity.labels,
     datasets: [{{
-      label: 'Highway (km)',
+      label: T.highway_km,
       data: D.highwayCity.highway,
       backgroundColor: 'rgba(59,130,246,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'City (km)',
+      label: T.city_km,
       data: D.highwayCity.city,
       backgroundColor: 'rgba(234,179,8,0.5)',
       borderRadius: 6,
@@ -1697,7 +1774,7 @@ createChart('highwayCity', {{
     responsive: true,
     scales: {{
       x: {{ stacked: true, grid: {{ display: false }} }},
-      y: {{ stacked: true, title: {{ display: true, text: 'km' }}, grid: {{ color: gridColor }} }}
+      y: {{ stacked: true, title: {{ display: true, text: T.km }}, grid: {{ color: gridColor }} }}
     }}
   }}
 }});
@@ -1708,7 +1785,7 @@ createChart('idleTrend', {{
   data: {{
     labels: D.idleTrend.labels,
     datasets: [{{
-      label: 'Idle %',
+      label: T.idle_pct,
       data: D.idleTrend.idle_pct,
       borderColor: '#a78bfa',
       backgroundColor: 'rgba(167,139,250,0.1)',
@@ -1720,7 +1797,7 @@ createChart('idleTrend', {{
   options: {{
     responsive: true,
     scales: {{
-      y: {{ title: {{ display: true, text: '%' }}, grid: {{ color: gridColor }} }},
+      y: {{ title: {{ display: true, text: T.pct }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1730,7 +1807,7 @@ createChart('idleTrend', {{
 createChart('nightDay', {{
   type: 'doughnut',
   data: {{
-    labels: ['Night', 'Day'],
+    labels: [T.night, T.day],
     datasets: [{{
       data: [D.nightDriving.night_count, D.nightDriving.day_count],
       backgroundColor: ['#1e3a5f','#fbbf24'],
@@ -1772,7 +1849,7 @@ createChart('seasonalEv', {{
   data: {{
     labels: D.seasonal.labels,
     datasets: [{{
-      label: 'Electric Ratio (%)',
+      label: T.electric_ratio_pct,
       data: D.seasonal.ev_ratio,
       backgroundColor: ['#60a5fa','#34d399','#fbbf24','#f97316'],
       borderRadius: 6,
@@ -1782,7 +1859,7 @@ createChart('seasonalEv', {{
     responsive: true,
     plugins: {{ legend: {{ display: false }} }},
     scales: {{
-      y: {{ title: {{ display: true, text: '%' }}, grid: {{ color: gridColor }}, max: 100 }},
+      y: {{ title: {{ display: true, text: T.pct }}, grid: {{ color: gridColor }}, max: 100 }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1794,7 +1871,7 @@ createChart('seasonalFuel', {{
   data: {{
     labels: D.seasonal.labels,
     datasets: [{{
-      label: 'L/100km',
+      label: T.l100km,
       data: D.seasonal.avg_fuel,
       backgroundColor: ['#60a5fa','#34d399','#fbbf24','#f97316'],
       borderRadius: 6,
@@ -1804,7 +1881,7 @@ createChart('seasonalFuel', {{
     responsive: true,
     plugins: {{ legend: {{ display: false }} }},
     scales: {{
-      y: {{ title: {{ display: true, text: 'L/100km' }}, grid: {{ color: gridColor }} }},
+      y: {{ title: {{ display: true, text: T.l100km }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1816,7 +1893,7 @@ createChart('monthlyScore', {{
   data: {{
     labels: D.monthly.labels,
     datasets: [{{
-      label: 'Avg Score',
+      label: T.avg_score,
       data: D.monthly.avg_score,
       borderColor: '#a78bfa',
       backgroundColor: 'rgba(167,139,250,0.1)',
@@ -1840,7 +1917,7 @@ createChart('scoreDist', {{
   data: {{
     labels: D.scoreDist.labels,
     datasets: [{{
-      label: 'Trips',
+      label: T.trips,
       data: D.scoreDist.counts,
       backgroundColor: D.scoreDist.labels.map((_,i) => {{
         const h = (i / D.scoreDist.labels.length) * 120;
@@ -1853,8 +1930,8 @@ createChart('scoreDist', {{
     responsive: true,
     plugins: {{ legend: {{ display: false }} }},
     scales: {{
-      y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
-      x: {{ title: {{ display: true, text: 'Score Range' }}, grid: {{ display: false }} }}
+      y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
+      x: {{ title: {{ display: true, text: T.score_range }}, grid: {{ display: false }} }}
     }}
   }}
 }});
@@ -1865,12 +1942,12 @@ createChart('weekday', {{
   data: {{
     labels: D.weekdayHour.weekday_labels,
     datasets: [{{
-      label: 'Trips',
+      label: T.trips,
       data: D.weekdayHour.weekday_trips,
       backgroundColor: 'rgba(14,165,233,0.7)',
       borderRadius: 6,
     }}, {{
-      label: 'Distance (km)',
+      label: T.distance_km,
       data: D.weekdayHour.weekday_distance,
       type: 'line',
       borderColor: '#f59e0b',
@@ -1882,8 +1959,8 @@ createChart('weekday', {{
   options: {{
     responsive: true,
     scales: {{
-      y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
-      y1: {{ position: 'right', title: {{ display: true, text: 'km' }}, grid: {{ display: false }} }},
+      y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
+      y1: {{ position: 'right', title: {{ display: true, text: T.km }}, grid: {{ display: false }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1895,7 +1972,7 @@ createChart('hourly', {{
   data: {{
     labels: D.weekdayHour.hour_labels,
     datasets: [{{
-      label: 'Trips',
+      label: T.trips,
       data: D.weekdayHour.hour_trips,
       backgroundColor: 'rgba(14,165,233,0.7)',
       borderRadius: 4,
@@ -1904,7 +1981,7 @@ createChart('hourly', {{
   options: {{
     responsive: true,
     scales: {{
-      y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
+      y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }} }}
     }}
   }}
@@ -1916,7 +1993,7 @@ createChart('fuelTrend', {{
   data: {{
     labels: D.rollingFuel.map(p => p.x),
     datasets: [{{
-      label: 'L/100km (20-trip rolling)',
+      label: T.l100km_rolling,
       data: D.rollingFuel.map(p => p.y),
       borderColor: '#ef4444',
       backgroundColor: 'rgba(239,68,68,0.08)',
@@ -1930,26 +2007,39 @@ createChart('fuelTrend', {{
     responsive: true,
     maintainAspectRatio: false,
     scales: {{
-      y: {{ title: {{ display: true, text: 'L/100km' }}, grid: {{ color: gridColor }} }},
+      y: {{ title: {{ display: true, text: T.l100km }}, grid: {{ color: gridColor }} }},
       x: {{ grid: {{ display: false }}, ticks: {{ maxTicksLimit: 15 }} }}
     }}
   }}
 }});
 
-// --- Top Trips Table ---
+// --- Top Journeys Table ---
 const tbody = document.getElementById('topTripsBody');
+function fmtMin(m) {{
+  const h = Math.floor(m / 60), mn = Math.round(m % 60);
+  return h > 0 ? `${{h}}h ${{mn}}m` : `${{mn}}m`;
+}}
 D.longestTrips.forEach(t => {{
   const tr = document.createElement('tr');
   tr.className = 'border-b border-themed row-hover';
+  const stops = t.legs - 1;
+  let stopsCell;
+  if (stops === 0) {{
+    stopsCell = '<span class="text-muted">—</span>';
+  }} else {{
+    const breakStr = t.breaks.map(b => Math.round(b) + 'm').join(' + ');
+    stopsCell = `<span title="${{breakStr}}" style="cursor:default">${{stops}} (${{breakStr}})</span>`;
+  }}
   tr.innerHTML = `
     <td class="py-2 px-3">${{t.date}}</td>
     <td class="text-right py-2 px-3 font-medium text-heading">${{t.distance}}</td>
-    <td class="text-right py-2 px-3">${{t.duration_min}}</td>
+    <td class="text-right py-2 px-3">${{fmtMin(t.driving_min)}}</td>
+    <td class="text-right py-2 px-3 text-muted">${{fmtMin(t.total_min)}}</td>
+    <td class="text-right py-2 px-3">${{stopsCell}}</td>
     <td class="text-right py-2 px-3">${{t.fuel}}</td>
+    <td class="text-right py-2 px-3">${{t.avg_fuel}}</td>
     <td class="text-right py-2 px-3">${{t.cost}} ${{D.currency.code}}</td>
-    <td class="text-right py-2 px-3">${{t.ev_pct}}%</td>
-    <td class="text-right py-2 px-3">${{t.max_speed ?? '—'}}</td>
-    <td class="text-right py-2 px-3">${{t.score ?? '—'}}</td>`;
+    <td class="text-right py-2 px-3">${{t.max_speed ?? '—'}}</td>`;
   tbody.appendChild(tr);
 }});
 
@@ -1978,7 +2068,7 @@ if (D.odometerData && D.odometerData.length > 1) {{
     data: {{
       labels: D.odometerData.map(d => d.date),
       datasets: [{{
-        label: 'Odometer (km)',
+        label: T.odometer_km,
         data: D.odometerData.map(d => d.odometer),
         borderColor: '#0ea5e9',
         backgroundColor: 'rgba(14,165,233,0.1)',
@@ -1990,7 +2080,7 @@ if (D.odometerData && D.odometerData.length > 1) {{
     options: {{
       responsive: true,
       scales: {{
-        y: {{ title: {{ display: true, text: 'km' }}, grid: {{ color: gridColor }} }},
+        y: {{ title: {{ display: true, text: T.km }}, grid: {{ color: gridColor }} }},
         x: {{ grid: {{ display: false }} }}
       }}
     }}
@@ -2009,7 +2099,7 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
     data: {{
       labels: D.drivingProfile.radar.labels,
       datasets: [{{
-        label: 'Your Profile',
+        label: T.your_profile,
         data: D.drivingProfile.radar.values,
         backgroundColor: 'rgba(145,127,101,0.2)',
         borderColor: '#917f65',
@@ -2040,7 +2130,7 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
     data: {{
       labels: D.drivingProfile.speedProfile.labels,
       datasets: [{{
-        label: 'Trips',
+        label: T.trips,
         data: D.drivingProfile.speedProfile.counts,
         backgroundColor: speedColors,
         borderRadius: 6,
@@ -2050,8 +2140,8 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
       responsive: true,
       plugins: {{ legend: {{ display: false }} }},
       scales: {{
-        y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
-        x: {{ title: {{ display: true, text: 'Avg Speed (km/h)' }}, grid: {{ display: false }} }}
+        y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
+        x: {{ title: {{ display: true, text: T.avg_speed_kmh }}, grid: {{ display: false }} }}
       }}
     }}
   }});
@@ -2060,7 +2150,7 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
   createChart('roadTypeChart', {{
     type: 'doughnut',
     data: {{
-      labels: ['Highway', 'City / Other'],
+      labels: [T.highway, T.city_other],
       datasets: [{{
         data: [D.drivingProfile.roadType.highway_pct, D.drivingProfile.roadType.city_pct],
         backgroundColor: ['#3b82f6','#f59e0b'],
@@ -2084,7 +2174,7 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
     data: {{
       labels: D.drivingProfile.tripDistribution.labels,
       datasets: [{{
-        label: 'Trips',
+        label: T.trips,
         data: D.drivingProfile.tripDistribution.counts,
         backgroundColor: 'rgba(14,165,233,0.7)',
         borderRadius: 6,
@@ -2094,7 +2184,7 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
       responsive: true,
       plugins: {{ legend: {{ display: false }} }},
       scales: {{
-        y: {{ title: {{ display: true, text: 'Trips' }}, grid: {{ color: gridColor }} }},
+        y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
         x: {{ grid: {{ display: false }} }}
       }}
     }}
@@ -2136,12 +2226,12 @@ if (D.engineRecommendation && D.engineRecommendation.scores) {{
     const reasonsHtml = rec.reasons.map(r => `<li class="flex items-start gap-2"><span class="text-lexus-600 mt-0.5">&#10003;</span><span>${{r}}</span></li>`).join('');
     recDiv.innerHTML = `
       <div class="flex items-center gap-3 mb-4">
-        <span class="px-3 py-1 rounded-full text-sm font-semibold bg-lexus-600 text-white">Best Match</span>
+        <span class="px-3 py-1 rounded-full text-sm font-semibold bg-lexus-600 text-white">${{T.best_match}}</span>
         <span class="text-xl font-bold text-heading">${{rec.label}} (${{rec.type}})</span>
         <span class="text-lg font-semibold text-muted ml-auto">${{rec.score}}/100</span>
       </div>
       <ul class="space-y-2 text-sm text-heading mb-4">${{reasonsHtml}}</ul>
-      <p class="text-xs text-muted"><strong>Trade-offs:</strong> ${{rec.tradeoffs}}</p>`;
+      <p class="text-xs text-muted"><strong>${{T.tradeoffs_label}}</strong> ${{rec.tradeoffs}}</p>`;
     cards.appendChild(recDiv);
   }}
 
@@ -2154,12 +2244,12 @@ if (D.engineRecommendation && D.engineRecommendation.scores) {{
     const ruReasonsHtml = ru.reasons.map(r => `<li class="flex items-start gap-2"><span class="text-muted mt-0.5">&#10003;</span><span>${{r}}</span></li>`).join('');
     ruDiv.innerHTML = `
       <div class="flex items-center gap-3 mb-4">
-        <span class="px-3 py-1 rounded-full text-sm font-semibold heat-btn-inactive">Runner-up</span>
+        <span class="px-3 py-1 rounded-full text-sm font-semibold heat-btn-inactive">${{T.runner_up}}</span>
         <span class="text-xl font-bold text-heading">${{ru.label}} (${{ru.type}})</span>
         <span class="text-lg font-semibold text-muted ml-auto">${{ru.score}}/100</span>
       </div>
       <ul class="space-y-2 text-sm text-heading mb-4">${{ruReasonsHtml}}</ul>
-      <p class="text-xs text-muted"><strong>Trade-offs:</strong> ${{ru.tradeoffs}}</p>`;
+      <p class="text-xs text-muted"><strong>${{T.tradeoffs_label}}</strong> ${{ru.tradeoffs}}</p>`;
     cards.appendChild(ruDiv);
   }}
 }}
@@ -2236,7 +2326,8 @@ function applyTheme(dark) {{
 
 def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
                                 country_code: str = "PL",
-                                currency_code: str | None = None) -> Path:
+                                currency_code: str | None = None,
+                                lang: str = "en") -> Path:
     """Build a dashboard HTML for a single vehicle. Returns the output path."""
     vin = vehicle["vin"]
     alias = vehicle["alias"]
@@ -2290,21 +2381,23 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
     odometer_data = load_telemetry_history(conn, vin)
     print(f"  {len(service_history)} service records, {len(odometer_data)} telemetry snapshots")
 
+    t = get_translations(lang)
+
     print("Computing aggregations...")
     kpis = compute_kpis(trips, price_fn=price_fn)
     monthly = compute_monthly(trips, price_fn=price_fn)
-    wh = compute_weekday_hour(trips)
+    wh = compute_weekday_hour(trips, t)
     sd = compute_score_distribution(trips)
-    lt = top_trips(trips, price_fn=price_fn)
-    tc = compute_trip_categories(trips)
-    sea = compute_seasonal(trips)
-    dm = compute_driving_modes(trips)
+    lt = top_journeys(trips, price_fn=price_fn)
+    tc = compute_trip_categories(trips, t)
+    sea = compute_seasonal(trips, t)
+    dm = compute_driving_modes(trips, t)
     sa = compute_speed_analytics(trips)
     hc = compute_highway_city_split(trips)
     nd = compute_night_driving(trips)
     idle = compute_idle_analysis(trips)
-    profile = compute_driving_profile(trips)
-    engine_rec = compute_engine_recommendation(trips, profile)
+    profile = compute_driving_profile(trips, t)
+    engine_rec = compute_engine_recommendation(trips, profile, t)
 
     print("Building HTML...")
     html = build_html(kpis, monthly, wh, sd, heatmap_layers, lt, tc, sea, trips,
@@ -2312,7 +2405,8 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
                       driving_profile=profile, engine_recommendation=engine_rec,
                       vehicle=vehicle,
                       currency_code=display_currency, currency_symbol=currency_symbol,
-                      country_code=country_code, fuel_type=fuel_type)
+                      country_code=country_code, fuel_type=fuel_type,
+                      t=t, lang=lang)
 
     # Save cache after all lookups
     save_cache(cache)
@@ -2343,9 +2437,12 @@ def main():
                         help="ISO country code for fuel prices (default: PL)")
     parser.add_argument("--currency", default=None,
                         help="Display currency code (default: country's native currency)")
+    parser.add_argument("--lang", default="en",
+                        help="Dashboard language: en, pl (default: en)")
     args = parser.parse_args()
 
     country_code = args.country.upper()
+    lang = args.lang.lower()
     # Validate country
     get_country_info(country_code)
 
@@ -2393,7 +2490,8 @@ def main():
     for vehicle in vehicles:
         path = build_dashboard_for_vehicle(conn, vehicle,
                                            country_code=country_code,
-                                           currency_code=args.currency)
+                                           currency_code=args.currency,
+                                           lang=lang)
         if path:
             outputs.append(path)
 

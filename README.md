@@ -62,11 +62,21 @@ python build_dashboard.py --country DE
 # Polish data shown in EUR (applies exchange rate conversion)
 python build_dashboard.py --country PL --currency EUR
 
+# Dashboard in Polish
+python build_dashboard.py --lang pl
+
+# Combine: Polish language, PL fuel prices, in EUR
+python build_dashboard.py --lang pl --country PL --currency EUR
+
 # Open your dashboard
 open dashboard_YourCarName.html
 ```
 
 The script automatically discovers all vehicles on your account and processes each one. No VIN configuration needed. Fuel type (gasoline/diesel/lpg) is auto-detected from the API — use `CAR_FUEL_TYPE` to override.
+
+### Supported languages
+
+The `--lang` flag sets the dashboard UI language. Currently supported: `en` (English, default) and `pl` (Polish).
 
 ### Supported countries
 
