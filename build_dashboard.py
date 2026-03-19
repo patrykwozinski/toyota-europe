@@ -743,11 +743,91 @@ def compute_driving_profile(trips: list[dict], t: dict | None = None) -> dict:
     }
 
 
-def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | None = None, fuel_type: str = "gasoline", engine_type: str | None = None) -> dict:
-    """Score 5 engine types based on driving patterns and recommend the best fit."""
+def _lerp(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
+    """Linear interpolation with clamping. Maps x in [x0,x1] to [y0,y1]."""
+    if x1 == x0:
+        return (y0 + y1) / 2
+    t = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+    return y0 + t * (y1 - y0)
+
+
+def _sigmoid_score(x: float, center: float, steepness: float, low: float, high: float) -> float:
+    """Smooth S-curve scoring for soft thresholds."""
+    z = steepness * (x - center)
+    z = max(-500, min(500, z))
+    sig = 1 / (1 + math.exp(-z))
+    return low + sig * (high - low)
+
+
+def _estimate_savings(kpis, monthly, price_fn, currency_symbol, current_engine="Petrol"):
+    """Estimate monthly/annual fuel cost projections per engine type.
+
+    All costs are computed relative to the user's *actual* monthly spend, which
+    belongs to ``current_engine``.  Other engines are scaled from that baseline
+    so the user sees realistic comparisons (e.g. "switching from HEV to Petrol
+    would cost 39% more").
+    """
+    if not monthly or not monthly.get("fuel_cost") or not kpis:
+        return None
+    costs = monthly["fuel_cost"]
+    dists = monthly["distance"]
+    n = min(6, len(costs))
+    if n == 0:
+        return None
+    recent_costs = costs[-n:]
+    recent_dists = dists[-n:]
+    avg_monthly_cost = sum(recent_costs) / n
+    avg_monthly_dist = sum(recent_dists) / n
+    if avg_monthly_cost <= 0 or avg_monthly_dist <= 0:
+        return None
+    current_cost_per_km = avg_monthly_cost / avg_monthly_dist
+    # Relative efficiency multipliers vs a hypothetical pure-petrol baseline.
+    # avg_monthly_cost already reflects the current engine's efficiency, so we
+    # first "undo" it to get a petrol-equivalent cost, then re-apply each
+    # engine's multiplier.
+    elec_ratio = 0.20  # BEV ~80% cheaper per km than petrol
+    petrol_mult = {
+        "BEV": elec_ratio,
+        "PHEV": 0.45 + 0.55 * elec_ratio,  # ~0.56
+        "HEV": 0.72,
+        "Petrol": 1.0,
+        "Diesel": 0.82,
+    }
+    # The user's actual cost *is* the cost at current_engine's multiplier.
+    current_mult = petrol_mult.get(current_engine, 1.0)
+    # Petrol-equivalent monthly cost (what the user would pay on pure petrol)
+    petrol_monthly = avg_monthly_cost / current_mult if current_mult > 0 else avg_monthly_cost
+    by_engine = {}
+    for eng, pmult in petrol_mult.items():
+        mc = round(petrol_monthly * pmult, 2)
+        saving = round(avg_monthly_cost - mc, 2)
+        pct = round((1 - mc / avg_monthly_cost) * 100, 1) if avg_monthly_cost > 0 else 0.0
+        by_engine[eng] = {
+            "monthly_cost": mc,
+            "annual_cost": round(mc * 12, 2),
+            "monthly_saving": saving,
+            "annual_saving": round(saving * 12, 2),
+            "pct_saving": pct,
+            "is_current": eng == current_engine,
+        }
+    return {
+        "current_monthly_cost": round(avg_monthly_cost, 2),
+        "currency_symbol": currency_symbol,
+        "current_engine": current_engine,
+        "by_engine": by_engine,
+    }
+
+
+def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | None = None,
+                                   fuel_type: str = "gasoline", engine_type: str | None = None,
+                                   seasonal=None, night_driving=None, kpis=None,
+                                   monthly=None, journeys=None, idle=None,
+                                   price_fn=None, currency_symbol="zl") -> dict:
+    """Score 5 engine types using 16 continuous factors and recommend the best fit."""
     if not trips:
         return {"scores": [], "recommendation": None, "runner_up": None, "current_engine": None}
 
+    # --- Aggregate trip data ---
     total_dist = sum(tr["distance_km"] for tr in trips)
     total_dur = sum(tr["duration_sec"] for tr in trips)
     ev_dist = sum(tr["ev_distance_km"] for tr in trips)
@@ -773,8 +853,14 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
     habits = profile.get("habits", {})
     trips_per_day = habits.get("trips_per_day", 0)
     weekend_pct = habits.get("weekend_pct", 0)
+    peak_hour_str = habits.get("peak_hour", "12:00")
+    try:
+        peak_hour = int(str(peak_hour_str).split(":")[0])
+    except (ValueError, AttributeError, IndexError):
+        peak_hour = 12
 
     driver_class = profile.get("classification", {}).get("label", "")
+    max_trip_km = max((tr["distance_km"] for tr in trips), default=0)
 
     engines = {
         "BEV": {"label": t["engine_bev"] if t else "Battery Electric", "icon": "battery-full"},
@@ -783,223 +869,232 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
         "Petrol": {"label": t["engine_petrol"] if t else "Petrol", "icon": "gas-pump"},
         "Diesel": {"label": t["engine_diesel"] if t else "Diesel", "icon": "oil-can"},
     }
+    ENGINE_KEYS = list(engines.keys())
 
+    # ==================================================================
+    # 16 CONTINUOUS FACTORS — each produces a 0-100 score per engine
+    # ==================================================================
+    factor_names = [
+        "trip_distance", "highway_city", "ev_readiness", "driving_style",
+        "short_trip_density", "fuel_efficiency", "speed_behavior", "driver_archetype",
+        "seasonal_resilience", "idle_impact", "journey_feasibility", "regen_braking",
+        "charging_alignment", "power_aggressiveness", "cost_sensitivity", "usage_pattern",
+    ]
+    factor_label_keys = [f"factor_{n}" for n in factor_names]
+    factor_labels = [
+        (t.get(k, k.replace("factor_", "").replace("_", " ").title()) if t
+         else k.replace("factor_", "").replace("_", " ").title())
+        for k in factor_label_keys
+    ]
+
+    weights = [0.12, 0.10, 0.08, 0.08, 0.06, 0.06, 0.05, 0.05,
+               0.06, 0.05, 0.08, 0.05, 0.03, 0.04, 0.05, 0.04]
+
+    NEUTRAL = {"BEV": 65, "PHEV": 65, "HEV": 65, "Petrol": 65, "Diesel": 65}
+
+    # F1: Trip Distance Fit — BEV excels short, Diesel excels long, PHEV/HEV peak mid
+    phev_f1 = (_lerp(avg_trip_km, 5, 40, 78, 92) if avg_trip_km <= 40
+               else _lerp(avg_trip_km, 40, 150, 92, 55))
+    hev_f1 = (_lerp(avg_trip_km, 5, 45, 72, 88) if avg_trip_km <= 45
+              else _lerp(avg_trip_km, 45, 150, 88, 52))
+    f1 = {
+        "BEV":    _lerp(avg_trip_km, 10, 150, 95, 28),
+        "PHEV":   phev_f1,
+        "HEV":    hev_f1,
+        "Petrol": _lerp(avg_trip_km, 10, 120, 45, 82),
+        "Diesel": _lerp(avg_trip_km, 15, 120, 25, 92),
+    }
+
+    # F2: Highway vs City Balance
+    f2 = {
+        "BEV":    _sigmoid_score(city_pct, 50, 0.08, 38, 95),
+        "PHEV":   _sigmoid_score(city_pct, 40, 0.06, 52, 90),
+        "HEV":    _sigmoid_score(city_pct, 45, 0.07, 48, 92),
+        "Petrol": _sigmoid_score(city_pct, 55, -0.05, 48, 82),
+        "Diesel": _sigmoid_score(city_pct, 45, -0.07, 28, 90),
+    }
+
+    # F3: EV Readiness (current EV usage appetite)
+    f3 = {
+        "BEV":    _sigmoid_score(ev_pct, 15, 0.12, 35, 95),
+        "PHEV":   _sigmoid_score(ev_pct, 10, 0.10, 48, 92),
+        "HEV":    _sigmoid_score(ev_pct, 5, 0.08, 58, 85),
+        "Petrol": _sigmoid_score(ev_pct, 20, -0.08, 20, 72),
+        "Diesel": _sigmoid_score(ev_pct, 15, -0.10, 15, 65),
+    }
+
+    # F4: Driving Style Harmony (smooth + eco + calm composite)
+    style_composite = 0.4 * smoothness + 0.35 * eco_score + 0.25 * calmness
+    f4 = {
+        "BEV":    _lerp(style_composite, 30, 85, 30, 95),
+        "PHEV":   _lerp(style_composite, 30, 85, 42, 88),
+        "HEV":    _lerp(style_composite, 30, 85, 45, 80),
+        "Petrol": _lerp(style_composite, 30, 85, 85, 42),
+        "Diesel": _lerp(style_composite, 30, 85, 72, 42),
+    }
+
+    # F5: Short Trip Density
+    f5 = {
+        "BEV":    _sigmoid_score(short_trip_pct, 35, 0.08, 45, 95),
+        "PHEV":   _sigmoid_score(short_trip_pct, 30, 0.06, 52, 85),
+        "HEV":    _sigmoid_score(short_trip_pct, 30, 0.06, 52, 88),
+        "Petrol": _sigmoid_score(short_trip_pct, 40, -0.06, 35, 78),
+        "Diesel": _sigmoid_score(short_trip_pct, 35, -0.08, 22, 82),
+    }
+
+    # F6: Fuel Efficiency Pressure (high consumption → push toward electrified)
+    f6 = {
+        "BEV":    _lerp(avg_fuel, 4, 9, 55, 95),
+        "PHEV":   _lerp(avg_fuel, 4, 9, 58, 88),
+        "HEV":    _lerp(avg_fuel, 4, 9, 65, 78),
+        "Petrol": _lerp(avg_fuel, 4, 9, 72, 38),
+        "Diesel": _lerp(avg_fuel, 4, 9, 68, 52),
+    }
+
+    # F7: Speed Behavior (disciplined → EV friendly)
+    f7 = {
+        "BEV":    _lerp(speed_discipline, 30, 85, 35, 92),
+        "PHEV":   _lerp(speed_discipline, 30, 85, 48, 88),
+        "HEV":    _lerp(speed_discipline, 30, 85, 45, 88),
+        "Petrol": _lerp(speed_discipline, 30, 85, 85, 48),
+        "Diesel": _lerp(speed_discipline, 30, 85, 80, 48),
+    }
+
+    # F8: Driver Archetype (categorical)
+    archetype_scores = {
+        "Eco Expert":      {"BEV": 95, "PHEV": 85, "HEV": 85, "Petrol": 30, "Diesel": 25},
+        "City Navigator":  {"BEV": 90, "PHEV": 80, "HEV": 85, "Petrol": 45, "Diesel": 25},
+        "Smooth Cruiser":  {"BEV": 80, "PHEV": 80, "HEV": 85, "Petrol": 60, "Diesel": 50},
+        "Highway Warrior": {"BEV": 40, "PHEV": 60, "HEV": 55, "Petrol": 80, "Diesel": 90},
+        "Spirited Driver": {"BEV": 35, "PHEV": 50, "HEV": 45, "Petrol": 90, "Diesel": 75},
+    }
+    f8 = archetype_scores.get(driver_class, {"BEV": 60, "PHEV": 74, "HEV": 70, "Petrol": 70, "Diesel": 62})
+
+    # F9: Seasonal Resilience (winter range loss, fuel spike)
+    if seasonal and seasonal.get("ev_ratio") and len(seasonal["ev_ratio"]) == 4:
+        winter_ev = seasonal["ev_ratio"][0]
+        summer_ev = seasonal["ev_ratio"][2]
+        winter_fuel = seasonal["avg_fuel"][0] if seasonal.get("avg_fuel") and len(seasonal["avg_fuel"]) > 2 else 0
+        summer_fuel = seasonal["avg_fuel"][2] if seasonal.get("avg_fuel") and len(seasonal["avg_fuel"]) > 2 else 0
+        ev_drop = max(0, summer_ev - winter_ev)
+        fuel_spike = max(0, winter_fuel - summer_fuel)
+        f9 = {
+            "BEV":    max(20, 88 - ev_drop * 1.8 - fuel_spike * 4),
+            "PHEV":   min(92, 75 + ev_drop * 0.3),
+            "HEV":    min(85, 72 + fuel_spike * 2),
+            "Petrol": _lerp(fuel_spike, 0, 2, 65, 72),
+            "Diesel": _lerp(fuel_spike, 0, 2, 68, 75),
+        }
+    else:
+        f9 = dict(NEUTRAL)
+
+    # F10: Idle Time Impact (EV/HEV waste nothing at idle; diesel worst)
+    idle_pct = kpis.get("idle_pct", 0) if kpis else 0
+    f10 = {
+        "BEV":    _lerp(idle_pct, 2, 20, 60, 98),
+        "PHEV":   _lerp(idle_pct, 2, 20, 58, 88),
+        "HEV":    _lerp(idle_pct, 2, 20, 55, 82),
+        "Petrol": _lerp(idle_pct, 2, 20, 70, 42),
+        "Diesel": _lerp(idle_pct, 2, 20, 68, 28),
+    }
+
+    # F11: Journey Feasibility (long trip break patterns for charging opportunity)
+    if journeys:
+        long_journeys = [j for j in journeys if j["distance"] > 250]
+        unchargeable = sum(1 for j in long_journeys if not any(b >= 20 for b in j.get("breaks", [])))
+        long_frac = len(long_journeys) / max(len(journeys), 1)
+        f11 = {
+            "BEV":    max(20, 88 - unchargeable * 12 - long_frac * 30),
+            "PHEV":   max(40, 85 - unchargeable * 5),
+            "HEV":    _lerp(long_frac, 0, 0.5, 75, 60),
+            "Petrol": _lerp(long_frac, 0, 0.5, 65, 82),
+            "Diesel": _lerp(long_frac, 0, 0.5, 60, 90),
+        }
+    else:
+        f11 = dict(NEUTRAL)
+
+    # F12: Regen Braking Potential (brake score + city driving)
+    brake_scores = [tr["score_brake"] for tr in trips if tr.get("score_brake") is not None]
+    avg_brake = sum(brake_scores) / len(brake_scores) if brake_scores else 50
+    regen_potential = 0.6 * (avg_brake / 100) + 0.4 * (city_pct / 100)
+    rp = regen_potential * 100
+    f12 = {
+        "BEV":    _lerp(rp, 20, 80, 48, 95),
+        "PHEV":   _lerp(rp, 20, 80, 48, 88),
+        "HEV":    _lerp(rp, 20, 80, 48, 92),
+        "Petrol": 62,
+        "Diesel": 62,
+    }
+
+    # F13: Charging Alignment (predictable commuter schedule → BEV friendly)
+    is_commuter = trips_per_day >= 1.5 and (6 <= peak_hour <= 9 or 16 <= peak_hour <= 19)
+    regularity = _lerp(trips_per_day, 0.5, 3, 40, 90)
+    f13 = {
+        "BEV":    max(20, min(95, regularity + (10 if is_commuter else 0))),
+        "PHEV":   max(20, min(95, regularity * 0.85 + (5 if is_commuter else 0))),
+        "HEV":    65,
+        "Petrol": _lerp(trips_per_day, 0.5, 3, 72, 55),
+        "Diesel": _lerp(trips_per_day, 0.5, 3, 70, 52),
+    }
+
+    # F14: Power Mode Aggressiveness (high power → favors petrol; drains BEV)
+    total_power_sec = sum(tr.get("power_time_sec", 0) for tr in trips)
+    power_ratio = (total_power_sec / total_dur * 100) if total_dur > 0 else 0
+    f14 = {
+        "BEV":    _lerp(power_ratio, 2, 25, 80, 25),
+        "PHEV":   _lerp(power_ratio, 2, 25, 72, 45),
+        "HEV":    _lerp(power_ratio, 2, 25, 72, 52),
+        "Petrol": _lerp(power_ratio, 2, 25, 52, 90),
+        "Diesel": _lerp(power_ratio, 2, 25, 55, 72),
+    }
+
+    # F15: Cost Sensitivity (high cost/km or rising costs → push toward electrified)
+    cost_per_km = kpis.get("cost_per_km", 0) if kpis else 0
+    cost_rising = False
+    if monthly and monthly.get("fuel_cost") and len(monthly["fuel_cost"]) >= 6:
+        recent_3 = sum(monthly["fuel_cost"][-3:]) / 3
+        prev_3 = sum(monthly["fuel_cost"][-6:-3]) / 3
+        if prev_3 > 0 and (recent_3 - prev_3) / prev_3 > 0.05:
+            cost_rising = True
+    cost_pressure = _lerp(cost_per_km, 0.08, 0.50, 0, 100)
+    if cost_rising:
+        cost_pressure = min(100, cost_pressure + 15)
+    f15 = {
+        "BEV":    _lerp(cost_pressure, 0, 100, 52, 92),
+        "PHEV":   _lerp(cost_pressure, 0, 100, 50, 85),
+        "HEV":    _lerp(cost_pressure, 0, 100, 52, 82),
+        "Petrol": _lerp(cost_pressure, 0, 100, 78, 38),
+        "Diesel": _lerp(cost_pressure, 0, 100, 72, 48),
+    }
+
+    # F16: Usage Pattern (weekday commuter → BEV; weekend leisure → PHEV/ICE)
+    f16 = {
+        "BEV":    _lerp(weekend_pct, 15, 70, 88, 42),
+        "PHEV":   _lerp(weekend_pct, 15, 70, 72, 82),
+        "HEV":    _lerp(weekend_pct, 15, 70, 78, 65),
+        "Petrol": _lerp(weekend_pct, 15, 70, 55, 78),
+        "Diesel": _lerp(weekend_pct, 15, 70, 50, 72),
+    }
+
+    factors = [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16]
+
+    # Compute weighted scores + per-factor breakdown
+    factor_breakdown = {}
     scores = {}
-    for eng in engines:
-        scores[eng] = 0
-
-    # Factor 1: Trip distance compatibility (30%)
-    # BEV best for short/medium, diesel best for long
-    if avg_trip_km < 20:
-        f1 = {"BEV": 95, "PHEV": 85, "HEV": 80, "Petrol": 50, "Diesel": 30}
-    elif avg_trip_km < 50:
-        f1 = {"BEV": 75, "PHEV": 90, "HEV": 85, "Petrol": 65, "Diesel": 55}
-    elif avg_trip_km < 100:
-        f1 = {"BEV": 55, "PHEV": 80, "HEV": 75, "Petrol": 80, "Diesel": 75}
-    else:
-        f1 = {"BEV": 35, "PHEV": 60, "HEV": 55, "Petrol": 75, "Diesel": 90}
-
-    # Factor 2: Highway vs city ratio (20%)
-    if city_pct > 70:
-        f2 = {"BEV": 95, "PHEV": 85, "HEV": 90, "Petrol": 50, "Diesel": 30}
-    elif city_pct > 50:
-        f2 = {"BEV": 75, "PHEV": 90, "HEV": 80, "Petrol": 70, "Diesel": 55}
-    elif highway_pct > 70:
-        f2 = {"BEV": 40, "PHEV": 55, "HEV": 50, "Petrol": 80, "Diesel": 90}
-    else:
-        f2 = {"BEV": 60, "PHEV": 80, "HEV": 75, "Petrol": 75, "Diesel": 70}
-
-    # Factor 3: EV usage appetite (15%)
-    if ev_pct > 40:
-        f3 = {"BEV": 95, "PHEV": 90, "HEV": 70, "Petrol": 20, "Diesel": 15}
-    elif ev_pct > 20:
-        f3 = {"BEV": 80, "PHEV": 85, "HEV": 80, "Petrol": 35, "Diesel": 25}
-    elif ev_pct > 5:
-        f3 = {"BEV": 60, "PHEV": 75, "HEV": 85, "Petrol": 50, "Diesel": 40}
-    else:
-        f3 = {"BEV": 40, "PHEV": 55, "HEV": 70, "Petrol": 70, "Diesel": 65}
-
-    # Factor 4: Driving style match (15%)
-    if smoothness >= 75 and eco_score >= 60:
-        f4 = {"BEV": 90, "PHEV": 85, "HEV": 85, "Petrol": 50, "Diesel": 45}
-    elif calmness < 40:
-        f4 = {"BEV": 40, "PHEV": 50, "HEV": 45, "Petrol": 85, "Diesel": 70}
-    else:
-        f4 = {"BEV": 65, "PHEV": 70, "HEV": 70, "Petrol": 70, "Diesel": 65}
-
-    # Factor 5: Short trip frequency (10%)
-    if short_trip_pct > 60:
-        f5 = {"BEV": 95, "PHEV": 80, "HEV": 85, "Petrol": 40, "Diesel": 25}
-    elif short_trip_pct > 30:
-        f5 = {"BEV": 80, "PHEV": 80, "HEV": 80, "Petrol": 60, "Diesel": 45}
-    else:
-        f5 = {"BEV": 50, "PHEV": 65, "HEV": 65, "Petrol": 75, "Diesel": 80}
-
-    # Factor 6: Fuel efficiency sensitivity (8%)
-    if avg_fuel > 7:
-        f6 = {"BEV": 90, "PHEV": 85, "HEV": 80, "Petrol": 40, "Diesel": 55}
-    elif avg_fuel > 5:
-        f6 = {"BEV": 75, "PHEV": 80, "HEV": 80, "Petrol": 60, "Diesel": 65}
-    else:
-        f6 = {"BEV": 60, "PHEV": 70, "HEV": 75, "Petrol": 70, "Diesel": 70}
-
-    # Factor 7: Speed discipline (8%)
-    if speed_discipline >= 75:
-        f7 = {"BEV": 90, "PHEV": 85, "HEV": 85, "Petrol": 55, "Diesel": 50}
-    elif speed_discipline >= 50:
-        f7 = {"BEV": 70, "PHEV": 75, "HEV": 75, "Petrol": 70, "Diesel": 65}
-    else:  # aggressive speeding
-        f7 = {"BEV": 40, "PHEV": 55, "HEV": 50, "Petrol": 85, "Diesel": 80}
-
-    # Factor 8: Driver classification (8%)
-    if driver_class == "Eco Expert":
-        f8 = {"BEV": 95, "PHEV": 85, "HEV": 85, "Petrol": 30, "Diesel": 25}
-    elif driver_class == "City Navigator":
-        f8 = {"BEV": 90, "PHEV": 80, "HEV": 85, "Petrol": 45, "Diesel": 25}
-    elif driver_class == "Smooth Cruiser":
-        f8 = {"BEV": 80, "PHEV": 80, "HEV": 85, "Petrol": 60, "Diesel": 50}
-    elif driver_class == "Highway Warrior":
-        f8 = {"BEV": 40, "PHEV": 60, "HEV": 55, "Petrol": 80, "Diesel": 90}
-    elif driver_class == "Spirited Driver":
-        f8 = {"BEV": 35, "PHEV": 50, "HEV": 45, "Petrol": 90, "Diesel": 75}
-    else:  # Balanced Driver / Unknown
-        f8 = {"BEV": 65, "PHEV": 75, "HEV": 75, "Petrol": 70, "Diesel": 65}
-
-    weights = [0.25, 0.18, 0.12, 0.12, 0.09, 0.08, 0.08, 0.08]
-    factors = [f1, f2, f3, f4, f5, f6, f7, f8]
-    for eng in engines:
-        total = sum(factors[i][eng] * weights[i] for i in range(8))
+    for eng in ENGINE_KEYS:
+        factor_breakdown[eng] = {}
+        total = 0
+        for f, w, name in zip(factors, weights, factor_names):
+            s = f[eng]
+            factor_breakdown[eng][name] = round(s, 1)
+            total += s * w
         scores[eng] = round(total, 1)
-
-    # BEV range gate: penalise if any single trip exceeds 300 km
-    max_trip_km = max(tr["distance_km"] for tr in trips)
-    if max_trip_km > 300:
-        scores["BEV"] = max(0, round(scores["BEV"] - 15, 1))
 
     sorted_engines = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     top_eng = sorted_engines[0][0]
     runner_eng = sorted_engines[1][0]
 
-    # Generate dynamic reasons for top recommendation
-    reasons_map = {
-        "BEV": [],
-        "PHEV": [],
-        "HEV": [],
-        "Petrol": [],
-        "Diesel": [],
-    }
-
-    if short_trip_pct > 50:
-        reasons_map["BEV"].append((t["reason_bev_short_trips"] if t else "{pct:.0f}% of your trips are under 15 km — perfect for battery range").format(pct=short_trip_pct))
-        reasons_map["PHEV"].append((t["reason_phev_short_trips"] if t else "{pct:.0f}% short trips can run on pure electric").format(pct=short_trip_pct))
-    if city_pct > 60:
-        reasons_map["BEV"].append((t["reason_bev_city"] if t else "{pct:.0f}% city driving maximizes regenerative braking").format(pct=city_pct))
-        reasons_map["HEV"].append((t["reason_hev_city"] if t else "{pct:.0f}% city driving is where hybrids shine most").format(pct=city_pct))
-        reasons_map["PHEV"].append((t["reason_phev_city"] if t else "{pct:.0f}% city driving enables frequent EV mode").format(pct=city_pct))
-    if ev_pct > 20:
-        reasons_map["BEV"].append((t["reason_bev_ev_ready"] if t else "Already {pct:.0f}% EV driving shows readiness for full electric").format(pct=ev_pct))
-        reasons_map["PHEV"].append((t["reason_phev_ev_usage"] if t else "Your {pct:.0f}% EV usage would increase with a larger battery").format(pct=ev_pct))
-    if eco_score >= 60:
-        reasons_map["BEV"].append(t["reason_bev_eco_style"] if t else "Your eco-conscious style maximizes EV efficiency")
-        reasons_map["HEV"].append(t["reason_hev_eco_style"] if t else "Your eco-conscious driving optimizes hybrid regeneration")
-    if avg_trip_km > 60:
-        reasons_map["Diesel"].append((t["reason_diesel_long_trip"] if t else "Average trip of {km:.0f} km favors diesel efficiency at cruise").format(km=avg_trip_km))
-        reasons_map["Petrol"].append((t["reason_petrol_long_trip"] if t else "Your {km:.0f} km average trip suits petrol's highway comfort").format(km=avg_trip_km))
-    if highway_pct > 50:
-        reasons_map["Diesel"].append((t["reason_diesel_highway"] if t else "{pct:.0f}% highway driving is diesel's sweet spot").format(pct=highway_pct))
-        reasons_map["Petrol"].append((t["reason_petrol_highway"] if t else "{pct:.0f}% highway driving suits petrol turbo engines").format(pct=highway_pct))
-    if calmness < 40:
-        reasons_map["Petrol"].append(t["reason_petrol_spirited"] if t else "Your spirited driving style pairs well with responsive petrol engines")
-    if avg_fuel > 6:
-        reasons_map["HEV"].append((t["reason_hev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a hybrid could cut consumption by 20-30%").format(fuel=avg_fuel))
-        reasons_map["PHEV"].append((t["reason_phev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a PHEV could slash your fuel costs").format(fuel=avg_fuel))
-    if trips_per_day >= 2:
-        reasons_map["BEV"].append((t["reason_bev_daily_trips"] if t else "Your {n:.1f} daily trips are ideal for overnight home charging").format(n=trips_per_day))
-    if weekend_pct > 60:
-        reasons_map["PHEV"].append(t["reason_phev_weekend"] if t else "Weekend-heavy use benefits from petrol backup on longer leisure trips")
-    if speed_discipline < 50:
-        reasons_map["Petrol"].append(t["reason_petrol_speed"] if t else "Your frequent high-speed driving suits petrol's broad RPM range")
-    if consistency >= 70:
-        reasons_map["BEV"].append(t["reason_bev_consistency"] if t else "Your consistent driving routine makes home charging planning easy")
-    if max_trip_km > 300:
-        reasons_map["BEV"].append(t["reason_bev_long_trip_note"] if t else "Note: your longest recorded trip exceeds 300 km — BEV charging stops required")
-
-    # Fallback reasons
-    if not reasons_map["BEV"]:
-        reasons_map["BEV"] = [t["reason_bev_fallback_1"] if t else "Zero emissions and lowest running costs", t["reason_bev_fallback_2"] if t else "Best for daily commutes and urban driving"]
-    if not reasons_map["PHEV"]:
-        reasons_map["PHEV"] = [t["reason_phev_fallback_1"] if t else "Flexibility of electric for short trips with petrol backup", t["reason_phev_fallback_2"] if t else "Good balance of efficiency and range"]
-    if not reasons_map["HEV"]:
-        reasons_map["HEV"] = [t["reason_hev_fallback_1"] if t else "No charging needed with self-charging hybrid system", t["reason_hev_fallback_2"] if t else "Great fuel efficiency in mixed driving"]
-    if not reasons_map["Petrol"]:
-        reasons_map["Petrol"] = [t["reason_petrol_fallback_1"] if t else "Wide availability and lower purchase price", t["reason_petrol_fallback_2"] if t else "Good for varied driving conditions"]
-    if not reasons_map["Diesel"]:
-        reasons_map["Diesel"] = [t["reason_diesel_fallback_1"] if t else "Best highway fuel economy for long distances", t["reason_diesel_fallback_2"] if t else "High torque for heavy loads"]
-
-    # Tradeoffs
-    tradeoffs_map = {
-        "BEV": t["tradeoff_bev"] if t else "Requires charging infrastructure; range limited on long highway trips",
-        "PHEV": t["tradeoff_phev"] if t else "Higher purchase price; needs regular charging to maximize savings",
-        "HEV": t["tradeoff_hev"] if t else "Less electric range than PHEV/BEV; still burns fuel for all trips",
-        "Petrol": t["tradeoff_petrol"] if t else "Higher fuel costs; more CO2 emissions than electrified options",
-        "Diesel": t["tradeoff_diesel"] if t else "Higher emissions in city; declining resale value in some markets",
-    }
-
-    # Why Not reasons (dynamic, profile-aware negatives)
-    why_not_map: dict[str, list[str]] = {"BEV": [], "PHEV": [], "HEV": [], "Petrol": [], "Diesel": []}
-
-    if max_trip_km > 300:
-        why_not_map["BEV"].append((t["why_not_bev_long_trip"] if t else "Your longest trip ({km:.0f} km) would require a mid-journey charging stop").format(km=max_trip_km))
-    if highway_pct > 60:
-        why_not_map["BEV"].append((t["why_not_bev_highway"] if t else "{pct:.0f}% highway driving reduces BEV range and regeneration efficiency").format(pct=highway_pct))
-    if speed_discipline < 50:
-        why_not_map["BEV"].append(t["why_not_bev_speed"] if t else "Frequent high-speed driving significantly drains the battery")
-    if not why_not_map["BEV"]:
-        why_not_map["BEV"].append(tradeoffs_map["BEV"])
-
-    if ev_pct < 5 and total_dist > 5000:
-        why_not_map["PHEV"].append(t["why_not_phev_no_charging"] if t else "Without regular plugging-in, a PHEV effectively becomes a heavy petrol car")
-    if avg_trip_km > 80:
-        why_not_map["PHEV"].append((t["why_not_phev_long_avg"] if t else "Long trips of {km:.0f} km average will mostly run on petrol, limiting EV benefit").format(km=avg_trip_km))
-    if not why_not_map["PHEV"]:
-        why_not_map["PHEV"].append(tradeoffs_map["PHEV"])
-
-    if ev_pct > 20:
-        why_not_map["HEV"].append(t["why_not_hev_ev_appetite"] if t else "Your EV appetite would be better served by a PHEV's larger battery")
-    if highway_pct > 60:
-        why_not_map["HEV"].append(t["why_not_hev_highway"] if t else "Highway-heavy driving reduces hybrid regeneration benefit")
-    if not why_not_map["HEV"]:
-        why_not_map["HEV"].append(tradeoffs_map["HEV"])
-
-    if short_trip_pct > 50:
-        why_not_map["Petrol"].append((t["why_not_petrol_short_trips"] if t else "{pct:.0f}% short trips cause cold-start engine wear and poor efficiency").format(pct=short_trip_pct))
-    if city_pct > 70:
-        why_not_map["Petrol"].append((t["why_not_petrol_city"] if t else "{pct:.0f}% city driving will hurt petrol fuel economy vs a hybrid").format(pct=city_pct))
-    if smoothness >= 75 and eco_score >= 60:
-        why_not_map["Petrol"].append(t["why_not_petrol_eco"] if t else "Your eco-conscious style is better rewarded in an electrified powertrain")
-    if not why_not_map["Petrol"]:
-        why_not_map["Petrol"].append(tradeoffs_map["Petrol"])
-
-    if city_pct > 70:
-        why_not_map["Diesel"].append((t["why_not_diesel_city"] if t else "{pct:.0f}% city driving risks DPF clogging and high urban NOx emissions").format(pct=city_pct))
-    if short_trip_pct > 50:
-        why_not_map["Diesel"].append(t["why_not_diesel_short"] if t else "Short trips damage diesel DPF filters and increase cold-start wear")
-    if avg_trip_km < 30:
-        why_not_map["Diesel"].append((t["why_not_diesel_avg_short"] if t else "Diesel efficiency gains only appear on sustained runs — your {km:.0f} km average is too short").format(km=avg_trip_km))
-    if not why_not_map["Diesel"]:
-        why_not_map["Diesel"].append(tradeoffs_map["Diesel"])
-
-    result_scores = []
-    for eng, score in sorted_engines:
-        result_scores.append({
-            "type": eng,
-            "label": engines[eng]["label"],
-            "score": score,
-            "reasons": reasons_map[eng][:4],
-            "why_not": why_not_map[eng][:3],
-        })
-
-    # Determine current engine type: prefer explicit DB value, fall back to heuristic
+    # Determine current engine type (needed for savings baseline)
     if engine_type in ("BEV", "PHEV", "HEV", "Petrol", "Diesel"):
         current_engine = engine_type
     elif fuel_type == "diesel":
@@ -1009,6 +1104,351 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
     else:
         current_engine = "Petrol"
 
+    # ==================================================================
+    # ESTIMATED SAVINGS
+    # ==================================================================
+    savings = _estimate_savings(kpis, monthly, price_fn, currency_symbol, current_engine)
+
+    # ==================================================================
+    # RISK FACTORS
+    # ==================================================================
+    risks_map: dict[str, list[dict]] = {e: [] for e in ENGINE_KEYS}
+
+    # BEV winter range risk
+    if seasonal and seasonal.get("ev_ratio") and len(seasonal["ev_ratio"]) == 4:
+        s_ev = seasonal["ev_ratio"][2]  # summer
+        w_ev = seasonal["ev_ratio"][0]  # winter
+        if s_ev > 0 and (s_ev - w_ev) / max(s_ev, 1) > 0.40:
+            risks_map["BEV"].append({
+                "label": t.get("risk_bev_winter", "Winter range loss") if t else "Winter range loss",
+                "detail": (t.get("risk_bev_winter_detail",
+                    "EV ratio drops from {s:.0f}% in summer to {w:.0f}% in winter — expect 20-30% range reduction")
+                    if t else "EV ratio drops from {s:.0f}% in summer to {w:.0f}% in winter — expect 20-30% range reduction"
+                ).format(s=s_ev, w=w_ev),
+                "severity": "high",
+            })
+
+    # BEV long trips without charging breaks
+    if journeys:
+        long_no_break = [j for j in journeys if j["distance"] > 250
+                         and not any(b >= 20 for b in j.get("breaks", []))]
+        if long_no_break:
+            risks_map["BEV"].append({
+                "label": t.get("risk_bev_long_trips", "Long trips without charging stops") if t else "Long trips without charging stops",
+                "detail": (t.get("risk_bev_long_trips_detail",
+                    "{n} of your top journeys exceed 250 km with no 20+ min break for charging")
+                    if t else "{n} of your top journeys exceed 250 km with no 20+ min break for charging"
+                ).format(n=len(long_no_break)),
+                "severity": "high" if len(long_no_break) >= 3 else "medium",
+            })
+
+    # BEV cross-border charging
+    countries_visited = kpis.get("countries_visited", 0) if kpis else 0
+    if countries_visited > 2:
+        risks_map["BEV"].append({
+            "label": t.get("risk_bev_cross_border", "Cross-border charging") if t else "Cross-border charging",
+            "detail": (t.get("risk_bev_cross_border_detail",
+                "Driving across {n} countries means varying charging networks and payment systems")
+                if t else "Driving across {n} countries means varying charging networks and payment systems"
+            ).format(n=countries_visited),
+            "severity": "medium",
+        })
+
+    # Diesel idle / DPF risk
+    if idle_pct > 10:
+        idle_hours = kpis.get("idle_hours", 0) if kpis else 0
+        risks_map["Diesel"].append({
+            "label": t.get("risk_diesel_idle", "High idle time (DPF wear)") if t else "High idle time (DPF wear)",
+            "detail": (t.get("risk_diesel_idle_detail",
+                "{pct:.0f}% idle time ({hrs:.0f}h total) accelerates DPF degradation and emissions")
+                if t else "{pct:.0f}% idle time ({hrs:.0f}h total) accelerates DPF degradation and emissions"
+            ).format(pct=idle_pct, hrs=idle_hours),
+            "severity": "high",
+        })
+
+    # Diesel short trips
+    if short_trip_pct > 60:
+        risks_map["Diesel"].append({
+            "label": t.get("risk_diesel_short_trips", "Too many short trips") if t else "Too many short trips",
+            "detail": (t.get("risk_diesel_short_trips_detail",
+                "{pct:.0f}% trips under 15 km prevent DPF regeneration and cause excessive engine wear")
+                if t else "{pct:.0f}% trips under 15 km prevent DPF regeneration and cause excessive engine wear"
+            ).format(pct=short_trip_pct),
+            "severity": "high",
+        })
+
+    # Petrol rising costs
+    if cost_rising:
+        risks_map["Petrol"].append({
+            "label": t.get("risk_petrol_rising_costs", "Rising fuel costs") if t else "Rising fuel costs",
+            "detail": (t.get("risk_petrol_rising_costs_detail",
+                "Your monthly fuel costs are trending upward — electrified options absorb price volatility better")
+                if t else "Your monthly fuel costs are trending upward — electrified options absorb price volatility better"),
+            "severity": "medium",
+        })
+
+    # ==================================================================
+    # WHY YES REASONS — strength-sorted, top 5
+    # ==================================================================
+    reasons_map: dict[str, list[tuple[float, str]]] = {e: [] for e in ENGINE_KEYS}
+
+    if short_trip_pct > 30:
+        s = short_trip_pct / 100
+        reasons_map["BEV"].append((s, (t["reason_bev_short_trips"] if t else "{pct:.0f}% of your trips are under 15 km — perfect for battery range").format(pct=short_trip_pct)))
+        reasons_map["PHEV"].append((s * 0.8, (t["reason_phev_short_trips"] if t else "{pct:.0f}% short trips can run on pure electric").format(pct=short_trip_pct)))
+
+    if city_pct > 45:
+        s = city_pct / 100
+        reasons_map["BEV"].append((s, (t["reason_bev_city"] if t else "{pct:.0f}% city driving maximizes regenerative braking").format(pct=city_pct)))
+        reasons_map["HEV"].append((s * 0.9, (t["reason_hev_city"] if t else "{pct:.0f}% city driving is where hybrids shine most").format(pct=city_pct)))
+        reasons_map["PHEV"].append((s * 0.85, (t["reason_phev_city"] if t else "{pct:.0f}% city driving enables frequent EV mode").format(pct=city_pct)))
+
+    if ev_pct > 10:
+        s = min(1.0, ev_pct / 100 * 1.5)
+        reasons_map["BEV"].append((s, (t["reason_bev_ev_ready"] if t else "Already {pct:.0f}% EV driving shows readiness for full electric").format(pct=ev_pct)))
+        reasons_map["PHEV"].append((s * 0.9, (t["reason_phev_ev_usage"] if t else "Your {pct:.0f}% EV usage would increase with a larger battery").format(pct=ev_pct)))
+
+    if eco_score >= 55:
+        s = eco_score / 100
+        reasons_map["BEV"].append((s, t["reason_bev_eco_style"] if t else "Your eco-conscious style maximizes EV efficiency"))
+        reasons_map["HEV"].append((s * 0.9, t["reason_hev_eco_style"] if t else "Your eco-conscious driving optimizes hybrid regeneration"))
+
+    if avg_trip_km > 50:
+        s = min(1.0, avg_trip_km / 150)
+        reasons_map["Diesel"].append((s, (t["reason_diesel_long_trip"] if t else "Average trip of {km:.0f} km favors diesel efficiency at cruise").format(km=avg_trip_km)))
+        reasons_map["Petrol"].append((s * 0.8, (t["reason_petrol_long_trip"] if t else "Your {km:.0f} km average trip suits petrol's highway comfort").format(km=avg_trip_km)))
+
+    if highway_pct > 40:
+        s = highway_pct / 100
+        reasons_map["Diesel"].append((s, (t["reason_diesel_highway"] if t else "{pct:.0f}% highway driving is diesel's sweet spot").format(pct=highway_pct)))
+        reasons_map["Petrol"].append((s * 0.8, (t["reason_petrol_highway"] if t else "{pct:.0f}% highway driving suits petrol turbo engines").format(pct=highway_pct)))
+
+    if calmness < 40:
+        reasons_map["Petrol"].append((0.7, t["reason_petrol_spirited"] if t else "Your spirited driving style pairs well with responsive petrol engines"))
+
+    if avg_fuel > 5.5:
+        s = min(1.0, avg_fuel / 10)
+        reasons_map["HEV"].append((s, (t["reason_hev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a hybrid could cut consumption by 20-30%").format(fuel=avg_fuel)))
+        reasons_map["PHEV"].append((s * 0.9, (t["reason_phev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a PHEV could slash your fuel costs").format(fuel=avg_fuel)))
+
+    if trips_per_day >= 1.5:
+        reasons_map["BEV"].append((0.6, (t["reason_bev_daily_trips"] if t else "Your {n:.1f} daily trips are ideal for overnight home charging").format(n=trips_per_day)))
+
+    if weekend_pct > 55:
+        reasons_map["PHEV"].append((0.5, t["reason_phev_weekend"] if t else "Weekend-heavy use benefits from petrol backup on longer leisure trips"))
+
+    if speed_discipline < 45:
+        reasons_map["Petrol"].append((0.5, t["reason_petrol_speed"] if t else "Your frequent high-speed driving suits petrol's broad RPM range"))
+
+    if consistency >= 65:
+        reasons_map["BEV"].append((0.55, t["reason_bev_consistency"] if t else "Your consistent driving routine makes home charging planning easy"))
+
+    # New: Idle savings
+    if idle_pct > 8:
+        idle_hours_val = kpis.get("idle_hours", 0) if kpis else 0
+        waste_l = idle_hours_val * 0.8
+        reasons_map["BEV"].append((min(1.0, idle_pct / 100 * 1.5), (t.get("reason_bev_idle_savings",
+            "Your {pct:.0f}% idle time wastes ~{liters:.0f}L of fuel — zero waste with BEV")
+            if t else "Your {pct:.0f}% idle time wastes ~{liters:.0f}L of fuel — zero waste with BEV"
+        ).format(pct=idle_pct, liters=waste_l)))
+        reasons_map["HEV"].append((idle_pct / 100, (t.get("reason_hev_idle_savings",
+            "Hybrid auto-stops during your {pct:.0f}% idle time, saving fuel")
+            if t else "Hybrid auto-stops during your {pct:.0f}% idle time, saving fuel"
+        ).format(pct=idle_pct)))
+
+    # New: Regen braking
+    if avg_brake >= 60 and city_pct > 50:
+        reasons_map["BEV"].append((0.65, (t.get("reason_bev_regen",
+            "Your braking score of {score:.0f} maximizes regenerative energy recovery")
+            if t else "Your braking score of {score:.0f} maximizes regenerative energy recovery"
+        ).format(score=avg_brake)))
+        reasons_map["HEV"].append((0.55, (t.get("reason_hev_regen",
+            "Your braking discipline (score {score:.0f}) enhances hybrid regeneration")
+            if t else "Your braking discipline (score {score:.0f}) enhances hybrid regeneration"
+        ).format(score=avg_brake)))
+
+    # New: Seasonal PHEV flexibility
+    if seasonal and seasonal.get("ev_ratio") and len(seasonal["ev_ratio"]) == 4:
+        s_ev_r = seasonal["ev_ratio"][2]
+        w_ev_r = seasonal["ev_ratio"][0]
+        if s_ev_r > 15 and (s_ev_r - w_ev_r) > 10:
+            reasons_map["PHEV"].append((0.6, (t.get("reason_phev_seasonal",
+                "PHEV adapts to seasons: EV in summer ({s:.0f}%), petrol backup in winter")
+                if t else "PHEV adapts to seasons: EV in summer ({s:.0f}%), petrol backup in winter"
+            ).format(s=s_ev_r)))
+
+    # New: Cost savings (only for engines that are cheaper than current)
+    if savings and savings.get("by_engine"):
+        for eng_key in ["BEV", "PHEV", "HEV"]:
+            eng_sav = savings["by_engine"].get(eng_key, {})
+            pct_sav = eng_sav.get("pct_saving", 0)
+            monthly_sav = eng_sav.get("monthly_saving", 0)
+            if pct_sav > 10 and not eng_sav.get("is_current"):
+                sym = savings.get("currency_symbol", "zl")
+                reasons_map[eng_key].append((pct_sav / 100, (t.get("reason_cost_savings",
+                    "Estimated {pct:.0f}% fuel cost reduction — saving ~{amount:.0f} {sym}/month")
+                    if t else "Estimated {pct:.0f}% fuel cost reduction — saving ~{amount:.0f} {sym}/month"
+                ).format(pct=pct_sav, amount=monthly_sav, sym=sym)))
+
+    # New: Diesel consistency
+    if consistency >= 70 and highway_pct > 40:
+        reasons_map["Diesel"].append((0.55, (t.get("reason_diesel_consistency",
+            "Your consistency score of {score:.0f} matches diesel's constant-speed efficiency")
+            if t else "Your consistency score of {score:.0f} matches diesel's constant-speed efficiency"
+        ).format(score=consistency)))
+
+    # BEV long trip note
+    if max_trip_km > 300:
+        reasons_map["BEV"].append((0.3, t["reason_bev_long_trip_note"] if t else "Note: your longest recorded trip exceeds 300 km — BEV charging stops required"))
+
+    # Sort by strength, keep top 5 text only
+    for eng in ENGINE_KEYS:
+        reasons_map[eng].sort(key=lambda x: x[0], reverse=True)
+        reasons_map[eng] = [text for _, text in reasons_map[eng][:5]]
+
+    # Fallback reasons
+    fallbacks = {
+        "BEV": [t["reason_bev_fallback_1"] if t else "Zero emissions and lowest running costs",
+                t["reason_bev_fallback_2"] if t else "Best for daily commutes and urban driving"],
+        "PHEV": [t["reason_phev_fallback_1"] if t else "Flexibility of electric for short trips with petrol backup",
+                 t["reason_phev_fallback_2"] if t else "Good balance of efficiency and range"],
+        "HEV": [t["reason_hev_fallback_1"] if t else "No charging needed with self-charging hybrid system",
+                t["reason_hev_fallback_2"] if t else "Great fuel efficiency in mixed driving"],
+        "Petrol": [t["reason_petrol_fallback_1"] if t else "Wide availability and lower purchase price",
+                   t["reason_petrol_fallback_2"] if t else "Good for varied driving conditions"],
+        "Diesel": [t["reason_diesel_fallback_1"] if t else "Best highway fuel economy for long distances",
+                   t["reason_diesel_fallback_2"] if t else "High torque for heavy loads"],
+    }
+    for eng in ENGINE_KEYS:
+        if not reasons_map[eng]:
+            reasons_map[eng] = fallbacks[eng]
+
+    # ==================================================================
+    # WHY NOT REASONS — strength-sorted, up to 4
+    # ==================================================================
+    why_not_map: dict[str, list[tuple[float, str]]] = {e: [] for e in ENGINE_KEYS}
+
+    tradeoffs_map = {
+        "BEV": t["tradeoff_bev"] if t else "Requires charging infrastructure; range limited on long highway trips",
+        "PHEV": t["tradeoff_phev"] if t else "Higher purchase price; needs regular charging to maximize savings",
+        "HEV": t["tradeoff_hev"] if t else "Less electric range than PHEV/BEV; still burns fuel for all trips",
+        "Petrol": t["tradeoff_petrol"] if t else "Higher fuel costs; more CO2 emissions than electrified options",
+        "Diesel": t["tradeoff_diesel"] if t else "Higher emissions in city; declining resale value in some markets",
+    }
+
+    # BEV
+    if max_trip_km > 200:
+        why_not_map["BEV"].append((0.9, (t["why_not_bev_long_trip"] if t else "Your longest trip ({km:.0f} km) would require a mid-journey charging stop").format(km=max_trip_km)))
+    if highway_pct > 50:
+        why_not_map["BEV"].append((0.7, (t["why_not_bev_highway"] if t else "{pct:.0f}% highway driving reduces BEV range and regeneration efficiency").format(pct=highway_pct)))
+    if speed_discipline < 45:
+        why_not_map["BEV"].append((0.6, t["why_not_bev_speed"] if t else "Frequent high-speed driving significantly drains the battery"))
+    if seasonal and seasonal.get("ev_ratio") and len(seasonal["ev_ratio"]) == 4:
+        s_ev_wn = seasonal["ev_ratio"][2]
+        w_ev_wn = seasonal["ev_ratio"][0]
+        if s_ev_wn > 10 and (s_ev_wn - w_ev_wn) / max(s_ev_wn, 1) > 0.30:
+            why_not_map["BEV"].append((0.65, (t.get("why_not_bev_winter",
+                "Winter EV ratio drops to {w:.0f}% from {s:.0f}% — expect 20-30% range loss")
+                if t else "Winter EV ratio drops to {w:.0f}% from {s:.0f}% — expect 20-30% range loss"
+            ).format(w=w_ev_wn, s=s_ev_wn)))
+    if journeys:
+        long_j = [j for j in journeys if j["distance"] > 300]
+        if long_j:
+            avg_long_km = sum(j["distance"] for j in long_j) / len(long_j)
+            why_not_map["BEV"].append((0.75, (t.get("why_not_bev_journeys",
+                "{n} of your top journeys exceed 300 km (avg {avg:.0f} km) — 1-2 charging stops each")
+                if t else "{n} of your top journeys exceed 300 km (avg {avg:.0f} km) — 1-2 charging stops each"
+            ).format(n=len(long_j), avg=avg_long_km)))
+
+    # PHEV
+    if ev_pct < 5 and total_dist > 5000:
+        why_not_map["PHEV"].append((0.8, t["why_not_phev_no_charging"] if t else "Without regular plugging-in, a PHEV effectively becomes a heavy petrol car"))
+    if avg_trip_km > 70:
+        why_not_map["PHEV"].append((0.6, (t["why_not_phev_long_avg"] if t else "Long trips of {km:.0f} km average will mostly run on petrol, limiting EV benefit").format(km=avg_trip_km)))
+
+    # HEV
+    if ev_pct > 20:
+        why_not_map["HEV"].append((0.7, (t.get("why_not_hev_ev_appetite_v2",
+            "Your {pct:.0f}% EV appetite exceeds standard hybrid capacity — consider PHEV")
+            if t else "Your {pct:.0f}% EV appetite exceeds standard hybrid capacity — consider PHEV"
+        ).format(pct=ev_pct)))
+    elif ev_pct > 15:
+        why_not_map["HEV"].append((0.5, t["why_not_hev_ev_appetite"] if t else "Your EV appetite would be better served by a PHEV's larger battery"))
+    if highway_pct > 55:
+        why_not_map["HEV"].append((0.5, t["why_not_hev_highway"] if t else "Highway-heavy driving reduces hybrid regeneration benefit"))
+
+    # Petrol
+    if short_trip_pct > 40:
+        why_not_map["Petrol"].append((0.7, (t["why_not_petrol_short_trips"] if t else "{pct:.0f}% short trips cause cold-start engine wear and poor efficiency").format(pct=short_trip_pct)))
+    if city_pct > 60:
+        why_not_map["Petrol"].append((0.65, (t["why_not_petrol_city"] if t else "{pct:.0f}% city driving will hurt petrol fuel economy vs a hybrid").format(pct=city_pct)))
+    if smoothness >= 70 and eco_score >= 55:
+        why_not_map["Petrol"].append((0.5, t["why_not_petrol_eco"] if t else "Your eco-conscious style is better rewarded in an electrified powertrain"))
+    if cost_rising:
+        why_not_map["Petrol"].append((0.55, t.get("why_not_petrol_rising_costs",
+            "Your fuel costs trending up — electrified options absorb price volatility better")
+            if t else "Your fuel costs trending up — electrified options absorb price volatility better"))
+
+    # Diesel
+    if city_pct > 60:
+        why_not_map["Diesel"].append((0.8, (t["why_not_diesel_city"] if t else "{pct:.0f}% city driving risks DPF clogging and high urban NOx emissions").format(pct=city_pct)))
+    if short_trip_pct > 40:
+        why_not_map["Diesel"].append((0.7, t["why_not_diesel_short"] if t else "Short trips damage diesel DPF filters and increase cold-start wear"))
+    if avg_trip_km < 30:
+        why_not_map["Diesel"].append((0.6, (t["why_not_diesel_avg_short"] if t else "Diesel efficiency gains only appear on sustained runs — your {km:.0f} km average is too short").format(km=avg_trip_km)))
+    if idle_pct > 10:
+        idle_hrs_wn = kpis.get("idle_hours", 0) if kpis else 0
+        why_not_map["Diesel"].append((0.65, (t.get("why_not_diesel_idle",
+            "Your {pct:.0f}% idle time ({hrs:.0f}h total) produces emissions and DPF wear")
+            if t else "Your {pct:.0f}% idle time ({hrs:.0f}h total) produces emissions and DPF wear"
+        ).format(pct=idle_pct, hrs=idle_hrs_wn)))
+
+    # Cost increase why-not for engines costlier than current
+    if savings and savings.get("by_engine"):
+        for eng_key in ENGINE_KEYS:
+            eng_sav = savings["by_engine"].get(eng_key, {})
+            pct_sav = eng_sav.get("pct_saving", 0)
+            monthly_extra = -eng_sav.get("monthly_saving", 0)
+            if pct_sav < -5 and not eng_sav.get("is_current"):
+                sym = savings.get("currency_symbol", "zl")
+                why_not_map[eng_key].append((0.6, (t.get("why_not_cost_increase",
+                    "Would cost ~{amount:.0f} {sym}/month more than your current {current} ({pct:.0f}% increase)")
+                    if t else "Would cost ~{amount:.0f} {sym}/month more than your current {current} ({pct:.0f}% increase)"
+                ).format(amount=monthly_extra, sym=sym, current=current_engine, pct=abs(pct_sav))))
+
+    # Sort by strength, take top 4; fallback to tradeoff
+    for eng in ENGINE_KEYS:
+        why_not_map[eng].sort(key=lambda x: x[0], reverse=True)
+        why_not_map[eng] = [text for _, text in why_not_map[eng][:4]]
+        if not why_not_map[eng]:
+            why_not_map[eng] = [tradeoffs_map[eng]]
+
+    # ==================================================================
+    # TOP FACTORS PER ENGINE
+    # ==================================================================
+    top_factors_map = {}
+    for eng in ENGINE_KEYS:
+        fb = factor_breakdown[eng]
+        sorted_fb = sorted(fb.items(), key=lambda x: x[1], reverse=True)
+        top_factors_map[eng] = [name for name, _ in sorted_fb[:3]]
+
+    # ==================================================================
+    # BUILD RESULT
+    # ==================================================================
+    result_scores = []
+    for eng, score in sorted_engines:
+        eng_savings = savings["by_engine"][eng] if savings and savings.get("by_engine") else None
+        result_scores.append({
+            "type": eng,
+            "label": engines[eng]["label"],
+            "score": score,
+            "reasons": reasons_map[eng],
+            "why_not": why_not_map[eng],
+            "risks": risks_map[eng],
+            "savings": eng_savings,
+            "top_factors": top_factors_map[eng],
+        })
+
     return {
         "scores": result_scores,
         "current_engine": current_engine,
@@ -1016,16 +1456,20 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
             "type": top_eng,
             "label": engines[top_eng]["label"],
             "score": scores[top_eng],
-            "reasons": reasons_map[top_eng][:4],
+            "reasons": reasons_map[top_eng][:5],
             "tradeoffs": tradeoffs_map[top_eng],
         },
         "runner_up": {
             "type": runner_eng,
             "label": engines[runner_eng]["label"],
             "score": scores[runner_eng],
-            "reasons": reasons_map[runner_eng][:2],
+            "reasons": reasons_map[runner_eng][:3],
             "tradeoffs": tradeoffs_map[runner_eng],
         },
+        "factor_breakdown": factor_breakdown,
+        "factor_names": factor_names,
+        "factor_labels": factor_labels,
+        "savings": savings,
     }
 
 
@@ -1058,7 +1502,12 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
 
     # Build JS translation subset (js_* keys + a few extras needed in chart labels)
     js_t = {k[3:]: v for k, v in (t or {}).items() if k.startswith("js_")}
-    for extra_key in ("night", "day", "highway", "city_other", "best_match", "runner_up", "tradeoffs_label", "why_yes_label", "why_not_label", "your_car"):
+    for extra_key in ("night", "day", "highway", "city_other", "best_match", "runner_up",
+                       "tradeoffs_label", "why_yes_label", "why_not_label", "your_car",
+                       "factor_breakdown_label", "risk_factors_label",
+                       "estimated_savings_label", "estimated_cost_change_label",
+                       "your_current_cost_label", "monthly_cost_label", "annual_cost_label",
+                       "eng_tab_why", "eng_tab_analysis", "eng_tab_cost"):
         if t and extra_key in t:
             js_t[extra_key] = t[extra_key]
 
@@ -2262,35 +2711,145 @@ if (D.engineRecommendation && D.engineRecommendation.scores) {{
     container.appendChild(div);
   }});
 
+  // Per-card tab switching
+  function switchEngineTab(engType, tabName) {{
+    const card = document.getElementById('eng-card-' + engType);
+    card.querySelectorAll('[data-eng-panel]').forEach(p => p.style.display = 'none');
+    card.querySelector('[data-eng-panel="' + tabName + '"]').style.display = '';
+    card.querySelectorAll('.eng-tab-btn').forEach(btn => {{
+      const isActive = btn.dataset.engTab === tabName;
+      btn.classList.toggle('bg-lexus-600', isActive);
+      btn.classList.toggle('text-white', isActive);
+      btn.classList.toggle('heat-btn-inactive', !isActive);
+    }});
+  }}
+
   const cards = document.getElementById('engineCards');
   const badgeLabels = [T.best_match, T.runner_up, '#3', '#4', '#5'];
   const currentEngine = D.engineRecommendation.current_engine;
+  const factorBreakdown = D.engineRecommendation.factor_breakdown || {{}};
+  const factorLabelsArr = D.engineRecommendation.factor_labels || [];
+  const factorNamesArr = D.engineRecommendation.factor_names || [];
+  const globalSavings = D.engineRecommendation.savings;
+  const tabWhy = T.eng_tab_why || 'Why';
+  const tabAnalysis = T.eng_tab_analysis || 'Analysis';
+  const tabCost = T.eng_tab_cost || 'Cost';
   D.engineRecommendation.scores.forEach((eng, i) => {{
     const isTop = i === 0;
     const isCurrent = eng.type === currentEngine;
     const card = document.createElement('div');
     card.className = 'rounded-xl p-6' + (isTop ? ' ring-2 ring-lexus-600' : '');
     card.style.background = 'var(--bg-body)';
+    card.id = 'eng-card-' + eng.type;
     if (!isTop) card.style.border = '1px solid var(--border-card)';
     const barColor = typeColors[eng.type] || '#917f65';
     const badgeClass = isTop ? 'bg-lexus-600 text-white' : 'heat-btn-inactive';
     const yourCarBadge = isCurrent ? `<span class="px-2 py-0.5 rounded-full text-xs font-semibold border border-amber-400 text-amber-600">${{T.your_car || 'Your Car'}}</span>` : '';
+    const hasRisks = eng.risks && eng.risks.length > 0;
+    const riskDot = hasRisks ? '<span class="inline-block w-2 h-2 rounded-full ml-1" style="background:#f59e0b"></span>' : '';
+
+    // --- Why panel content ---
     const reasonsHtml = (eng.reasons || []).map(r => `<li class="flex items-start gap-2"><span class="text-lexus-600 mt-0.5">&#10003;</span><span>${{r}}</span></li>`).join('');
     const whyNotHtml = (eng.why_not || []).map(r => `<li class="flex items-start gap-2"><span class="text-muted mt-0.5">&#10007;</span><span>${{r}}</span></li>`).join('');
+
+    // --- Analysis panel content ---
+    let factorHtml = '';
+    const fb = factorBreakdown[eng.type];
+    if (fb) {{
+      const sorted = Object.entries(fb).sort((a,b) => b[1] - a[1]).slice(0, 5);
+      const bars = sorted.map(([name, score]) => {{
+        const idx = factorNamesArr.indexOf(name);
+        const label = idx >= 0 && factorLabelsArr[idx] ? factorLabelsArr[idx] : name.replace(/_/g, ' ');
+        return `<div class="flex items-center gap-2 text-xs">
+          <span class="w-28 text-muted truncate">${{label}}</span>
+          <div class="flex-1 rounded-full h-1.5" style="background:var(--border-card)">
+            <div class="h-1.5 rounded-full" style="width:${{score}}%;background:${{barColor}};opacity:0.7"></div>
+          </div>
+          <span class="text-muted w-8 text-right">${{score}}</span>
+        </div>`;
+      }}).join('');
+      factorHtml = `<div class="text-xs font-semibold text-muted mb-2">${{T.factor_breakdown_label || 'TOP FACTORS'}}</div>
+        <div class="space-y-1">${{bars}}</div>`;
+    }}
+
+    let risksHtml = '';
+    if (hasRisks) {{
+      const sevBadge = {{
+        high: '<span class="inline-block w-2 h-2 rounded-full mr-1" style="background:#ef4444"></span>',
+        medium: '<span class="inline-block w-2 h-2 rounded-full mr-1" style="background:#f59e0b"></span>',
+        low: '<span class="inline-block w-2 h-2 rounded-full mr-1" style="background:#3b82f6"></span>'
+      }};
+      const items = eng.risks.map(r => `<div class="flex items-start gap-2 text-xs">
+        <span class="mt-0.5">${{sevBadge[r.severity] || ''}}</span>
+        <div><span class="font-semibold text-heading">${{r.label}}</span><br><span class="text-muted">${{r.detail}}</span></div>
+      </div>`).join('');
+      risksHtml = `<div class="mt-3 pt-3 border-t" style="border-color:var(--border-card)">
+        <div class="text-xs font-semibold mb-2" style="color:#f59e0b">${{T.risk_factors_label || 'RISK FACTORS'}}</div>
+        <div class="space-y-2">${{items}}</div>
+      </div>`;
+    }}
+
+    // --- Cost panel content ---
+    let costHtml = '';
+    if (eng.savings) {{
+      const s = eng.savings;
+      const sym = (globalSavings && globalSavings.currency_symbol) || '';
+      if (s.is_current) {{
+        costHtml = `<div class="rounded-lg p-3" style="background:var(--bg-card)">
+          <div class="text-xs font-semibold text-muted mb-2">${{T.your_current_cost_label || 'YOUR CURRENT FUEL COST'}}</div>
+          <div class="grid grid-cols-2 gap-2 text-sm">
+            <div><span class="text-muted text-xs">${{T.monthly_cost_label || 'Monthly'}}</span><br><span class="font-bold text-heading">${{Math.round(s.monthly_cost)}} ${{sym}}</span></div>
+            <div><span class="text-muted text-xs">${{T.annual_cost_label || 'Annual'}}</span><br><span class="font-bold text-heading">${{Math.round(s.annual_cost)}} ${{sym}}</span></div>
+          </div>
+        </div>`;
+      }} else {{
+        const isGreen = s.pct_saving > 0;
+        const color = isGreen ? 'color:#22c55e' : 'color:#ef4444';
+        const arrow = isGreen ? '&#8595;' : '&#8593;';
+        const sign = isGreen ? '-' : '+';
+        const label = isGreen
+          ? (T.estimated_savings_label || 'ESTIMATED FUEL SAVINGS')
+          : (T.estimated_cost_change_label || 'ESTIMATED FUEL COST');
+        costHtml = `<div class="rounded-lg p-3" style="background:var(--bg-card)">
+          <div class="text-xs font-semibold text-muted mb-2">${{label}}</div>
+          <div class="grid grid-cols-2 gap-2 text-sm">
+            <div><span class="text-muted text-xs">${{T.monthly_cost_label || 'Monthly'}}</span><br><span class="font-bold text-heading">${{Math.round(s.monthly_cost)}} ${{sym}}</span></div>
+            <div><span class="text-muted text-xs">${{T.annual_cost_label || 'Annual'}}</span><br><span class="font-bold text-heading">${{Math.round(s.annual_cost)}} ${{sym}}</span></div>
+          </div>
+          <div class="text-xs mt-2 font-semibold" style="${{color}}">${{arrow}} ${{Math.abs(s.pct_saving).toFixed(0)}}% vs ${{T.your_car || 'current'}} &bull; ${{sign}}${{Math.abs(Math.round(s.monthly_saving))}} ${{sym}}/mo</div>
+        </div>`;
+      }}
+    }}
+
+    const et = eng.type;
     card.innerHTML = `
       <div class="flex items-center gap-3 mb-3 flex-wrap">
         <span class="px-3 py-1 rounded-full text-sm font-semibold ${{badgeClass}}">${{badgeLabels[i] || ('#' + (i+1))}}</span>
         ${{yourCarBadge}}
-        <span class="font-bold text-heading">${{eng.label}} (${{eng.type}})</span>
+        <span class="font-bold text-heading">${{eng.label}} (${{eng.type}})${{riskDot}}</span>
         <span class="text-sm font-semibold text-muted ml-auto">${{eng.score}}/100</span>
       </div>
       <div class="w-full rounded-full h-1.5 mb-4" style="background:var(--border-card)">
         <div class="h-1.5 rounded-full" style="width:${{eng.score}}%;background:${{barColor}}"></div>
       </div>
-      <div class="text-xs font-semibold text-lexus-600 mb-1">${{T.why_yes_label || 'WHY YES'}}</div>
-      <ul class="space-y-1 text-sm text-heading mb-3">${{reasonsHtml}}</ul>
-      <div class="text-xs font-semibold text-muted mb-1">${{T.why_not_label || 'WHY NOT'}}</div>
-      <ul class="space-y-1 text-sm text-muted">${{whyNotHtml}}</ul>`;
+      <div class="inline-flex rounded-full p-0.5 gap-0.5 mb-4" style="background:var(--border-card)">
+        <button class="eng-tab-btn bg-lexus-600 text-white rounded-full text-xs px-3 py-1 font-semibold cursor-pointer" data-eng-tab="why" onclick="switchEngineTab('${{et}}','why')">${{tabWhy}}</button>
+        <button class="eng-tab-btn heat-btn-inactive rounded-full text-xs px-3 py-1 font-semibold cursor-pointer" data-eng-tab="analysis" onclick="switchEngineTab('${{et}}','analysis')">${{tabAnalysis}}</button>
+        <button class="eng-tab-btn heat-btn-inactive rounded-full text-xs px-3 py-1 font-semibold cursor-pointer" data-eng-tab="cost" onclick="switchEngineTab('${{et}}','cost')">${{tabCost}}</button>
+      </div>
+      <div data-eng-panel="why">
+        <div class="text-xs font-semibold text-lexus-600 mb-1">${{T.why_yes_label || 'WHY YES'}}</div>
+        <ul class="space-y-1 text-sm text-heading mb-3">${{reasonsHtml}}</ul>
+        <div class="text-xs font-semibold text-muted mb-1">${{T.why_not_label || 'WHY NOT'}}</div>
+        <ul class="space-y-1 text-sm text-muted">${{whyNotHtml}}</ul>
+      </div>
+      <div data-eng-panel="analysis" style="display:none">
+        ${{factorHtml}}
+        ${{risksHtml}}
+      </div>
+      <div data-eng-panel="cost" style="display:none">
+        ${{costHtml}}
+      </div>`;
     cards.appendChild(card);
   }});
 }}
@@ -2438,7 +2997,13 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
     nd = compute_night_driving(trips)
     idle = compute_idle_analysis(trips)
     profile = compute_driving_profile(trips, t)
-    engine_rec = compute_engine_recommendation(trips, profile, t, fuel_type=fuel_type, engine_type=vehicle.get("engine_type"))
+    engine_rec = compute_engine_recommendation(
+        trips, profile, t, fuel_type=fuel_type,
+        engine_type=vehicle.get("engine_type"),
+        seasonal=sea, night_driving=nd, kpis=kpis,
+        monthly=monthly, journeys=lt, idle=idle,
+        price_fn=price_fn, currency_symbol=currency_symbol,
+    )
 
     print("Building HTML...")
     html = build_html(kpis, monthly, wh, sd, heatmap_layers, lt, tc, sea, trips,

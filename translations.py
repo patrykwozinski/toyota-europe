@@ -237,6 +237,71 @@ TRANSLATIONS = {
         "tradeoff_petrol": "Higher fuel costs; more CO2 emissions than electrified options",
         "tradeoff_diesel": "Higher emissions in city; declining resale value in some markets",
 
+        # Factor labels (16 factors)
+        "factor_trip_distance": "Trip Distance",
+        "factor_highway_city": "Highway/City",
+        "factor_ev_readiness": "EV Readiness",
+        "factor_driving_style": "Driving Style",
+        "factor_short_trip_density": "Short Trips",
+        "factor_fuel_efficiency": "Fuel Efficiency",
+        "factor_speed_behavior": "Speed Behavior",
+        "factor_driver_archetype": "Driver Type",
+        "factor_seasonal_resilience": "Seasonal",
+        "factor_idle_impact": "Idle Impact",
+        "factor_journey_feasibility": "Journey Fit",
+        "factor_regen_braking": "Regen Braking",
+        "factor_charging_alignment": "Charging Fit",
+        "factor_power_aggressiveness": "Power Usage",
+        "factor_cost_sensitivity": "Cost Pressure",
+        "factor_usage_pattern": "Usage Pattern",
+
+        # UI section labels
+        "factor_breakdown_label": "TOP FACTORS",
+        "risk_factors_label": "RISK FACTORS",
+        "estimated_savings_label": "ESTIMATED FUEL SAVINGS",
+        "monthly_cost_label": "Monthly",
+        "annual_cost_label": "Annual",
+
+        # New reason templates
+        "reason_bev_idle_savings": "Your {pct:.0f}% idle time wastes ~{liters:.0f}L of fuel — zero waste with BEV",
+        "reason_hev_idle_savings": "Hybrid auto-stops during your {pct:.0f}% idle time, saving fuel",
+        "reason_bev_regen": "Your braking score of {score:.0f} maximizes regenerative energy recovery",
+        "reason_hev_regen": "Your braking discipline (score {score:.0f}) enhances hybrid regeneration",
+        "reason_phev_seasonal": "PHEV adapts to seasons: EV in summer ({s:.0f}%), petrol backup in winter",
+        "reason_cost_savings": "Estimated {pct:.0f}% fuel cost reduction — saving ~{amount:.0f} {sym}/month",
+        "reason_diesel_consistency": "Your consistency score of {score:.0f} matches diesel's constant-speed efficiency",
+
+        # New why_not templates
+        "why_not_bev_winter": "Winter EV ratio drops to {w:.0f}% from {s:.0f}% — expect 20-30% range loss",
+        "why_not_bev_journeys": "{n} of your top journeys exceed 300 km (avg {avg:.0f} km) — 1-2 charging stops each",
+        "why_not_hev_ev_appetite_v2": "Your {pct:.0f}% EV appetite exceeds standard hybrid capacity — consider PHEV",
+        "why_not_petrol_rising_costs": "Your fuel costs trending up — electrified options absorb price volatility better",
+        "why_not_diesel_idle": "Your {pct:.0f}% idle time ({hrs:.0f}h total) produces emissions and DPF wear",
+        "why_not_cost_increase": "Would cost ~{amount:.0f} {sym}/month more than your current {current} ({pct:.0f}% increase)",
+
+        # UI labels for savings box
+        "your_current_cost_label": "YOUR CURRENT FUEL COST",
+        "estimated_cost_change_label": "ESTIMATED FUEL COST",
+
+        # Risk labels
+        "risk_bev_winter": "Winter range loss",
+        "risk_bev_winter_detail": "EV ratio drops from {s:.0f}% in summer to {w:.0f}% in winter — expect 20-30% range reduction",
+        "risk_bev_long_trips": "Long trips without charging stops",
+        "risk_bev_long_trips_detail": "{n} of your top journeys exceed 250 km with no 20+ min break for charging",
+        "risk_bev_cross_border": "Cross-border charging",
+        "risk_bev_cross_border_detail": "Driving across {n} countries means varying charging networks and payment systems",
+        "risk_diesel_idle": "High idle time (DPF wear)",
+        "risk_diesel_idle_detail": "{pct:.0f}% idle time ({hrs:.0f}h total) accelerates DPF degradation and emissions",
+        "risk_diesel_short_trips": "Too many short trips",
+        "risk_diesel_short_trips_detail": "{pct:.0f}% trips under 15 km prevent DPF regeneration and cause excessive engine wear",
+        "risk_petrol_rising_costs": "Rising fuel costs",
+        "risk_petrol_rising_costs_detail": "Your monthly fuel costs are trending upward — electrified options absorb price volatility better",
+
+        # Engine card tab labels
+        "eng_tab_why": "Why",
+        "eng_tab_analysis": "Analysis",
+        "eng_tab_cost": "Cost",
+
         # JS chart labels (embedded in const T)
         "js_distance_km": "Distance (km)",
         "js_trips": "Trips",
@@ -496,6 +561,71 @@ TRANSLATIONS = {
         "tradeoff_hev": "Mniejszy zasięg elektryczny niż PHEV/BEV; nadal spala paliwo na każdej podróży",
         "tradeoff_petrol": "Wyższe koszty paliwa; większa emisja CO2 niż opcje zelektryfikowane",
         "tradeoff_diesel": "Wyższa emisja w mieście; spadająca wartość odsprzedaży na niektórych rynkach",
+
+        # Factor labels (16 factors)
+        "factor_trip_distance": "Dystans podróży",
+        "factor_highway_city": "Autostrada/miasto",
+        "factor_ev_readiness": "Gotowość EV",
+        "factor_driving_style": "Styl jazdy",
+        "factor_short_trip_density": "Krótkie trasy",
+        "factor_fuel_efficiency": "Zużycie paliwa",
+        "factor_speed_behavior": "Zachowanie prędkości",
+        "factor_driver_archetype": "Typ kierowcy",
+        "factor_seasonal_resilience": "Sezonowość",
+        "factor_idle_impact": "Wpływ postoju",
+        "factor_journey_feasibility": "Dopasowanie tras",
+        "factor_regen_braking": "Hamowanie odzyskowe",
+        "factor_charging_alignment": "Dopasowanie ładowania",
+        "factor_power_aggressiveness": "Użycie mocy",
+        "factor_cost_sensitivity": "Presja kosztów",
+        "factor_usage_pattern": "Wzorzec użytkowania",
+
+        # UI section labels
+        "factor_breakdown_label": "KLUCZOWE CZYNNIKI",
+        "risk_factors_label": "CZYNNIKI RYZYKA",
+        "estimated_savings_label": "SZACOWANE OSZCZĘDNOŚCI PALIWA",
+        "monthly_cost_label": "Miesięcznie",
+        "annual_cost_label": "Rocznie",
+
+        # New reason templates
+        "reason_bev_idle_savings": "Twój {pct:.0f}% czas postoju marnuje ~{liters:.0f}L paliwa — zero strat z BEV",
+        "reason_hev_idle_savings": "Hybryda automatycznie wyłącza silnik podczas {pct:.0f}% postoju, oszczędzając paliwo",
+        "reason_bev_regen": "Twój wynik hamowania {score:.0f} maksymalizuje odzyskiwanie energii z rekuperacji",
+        "reason_hev_regen": "Twoja dyscyplina hamowania (wynik {score:.0f}) wzmacnia rekuperację hybrydy",
+        "reason_phev_seasonal": "PHEV dostosowuje się do pór roku: EV latem ({s:.0f}%), benzyna zimą",
+        "reason_cost_savings": "Szacowane {pct:.0f}% zmniejszenie kosztów paliwa — oszczędność ~{amount:.0f} {sym}/mies.",
+        "reason_diesel_consistency": "Twój wynik stabilności {score:.0f} pasuje do wydajności diesla przy stałej prędkości",
+
+        # New why_not templates
+        "why_not_bev_winter": "Zimowy udział EV spada do {w:.0f}% z {s:.0f}% — spodziewaj się 20-30% utraty zasięgu",
+        "why_not_bev_journeys": "{n} z Twoich najdłuższych podróży przekracza 300 km (śr. {avg:.0f} km) — 1-2 postoje na ładowanie",
+        "why_not_hev_ev_appetite_v2": "Twój {pct:.0f}% apetyt na EV przekracza pojemność standardowej hybrydy — rozważ PHEV",
+        "why_not_petrol_rising_costs": "Twoje koszty paliwa rosną — zelektryfikowane opcje lepiej absorbują wahania cen",
+        "why_not_diesel_idle": "Twój {pct:.0f}% czas postoju ({hrs:.0f}h łącznie) generuje emisje i zużywa filtr DPF",
+        "why_not_cost_increase": "Kosztowałby ~{amount:.0f} {sym}/mies. więcej niż Twój obecny {current} (wzrost o {pct:.0f}%)",
+
+        # UI labels for savings box
+        "your_current_cost_label": "TWÓJ OBECNY KOSZT PALIWA",
+        "estimated_cost_change_label": "SZACOWANY KOSZT PALIWA",
+
+        # Risk labels
+        "risk_bev_winter": "Utrata zasięgu zimą",
+        "risk_bev_winter_detail": "Udział EV spada z {s:.0f}% latem do {w:.0f}% zimą — spodziewaj się 20-30% redukcji zasięgu",
+        "risk_bev_long_trips": "Długie trasy bez postojów na ładowanie",
+        "risk_bev_long_trips_detail": "{n} z Twoich najdłuższych podróży przekracza 250 km bez 20+ min przerwy na ładowanie",
+        "risk_bev_cross_border": "Ładowanie transgraniczne",
+        "risk_bev_cross_border_detail": "Jazda przez {n} krajów oznacza różne sieci ładowania i systemy płatności",
+        "risk_diesel_idle": "Wysoki czas postoju (zużycie DPF)",
+        "risk_diesel_idle_detail": "{pct:.0f}% czasu postoju ({hrs:.0f}h łącznie) przyspiesza degradację DPF i emisje",
+        "risk_diesel_short_trips": "Za dużo krótkich podróży",
+        "risk_diesel_short_trips_detail": "{pct:.0f}% podróży poniżej 15 km uniemożliwia regenerację DPF i powoduje nadmierne zużycie silnika",
+        "risk_petrol_rising_costs": "Rosnące koszty paliwa",
+        "risk_petrol_rising_costs_detail": "Twoje miesięczne koszty paliwa rosną — zelektryfikowane opcje lepiej absorbują wahania cen",
+
+        # Engine card tab labels
+        "eng_tab_why": "Dlaczego",
+        "eng_tab_analysis": "Analiza",
+        "eng_tab_cost": "Koszt",
 
         # JS chart labels
         "js_distance_km": "Dystans (km)",
