@@ -32,6 +32,12 @@ python build_dashboard.py --country DE
 
 # Dashboard with currency conversion (e.g. PL prices shown in EUR)
 python build_dashboard.py --country PL --currency EUR
+
+# Dashboard without micro-trip merging (raw API trips)
+python build_dashboard.py --no-merge
+
+# Dashboard with custom merge gap (default: 5 minutes)
+python build_dashboard.py --merge-gap 10
 ```
 
 ## Architecture

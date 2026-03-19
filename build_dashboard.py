@@ -360,6 +360,94 @@ def top_journeys(trips: list[dict], n: int = 20, max_gap_min: int = 45, price_fn
     return result[:n]
 
 
+def _merge_trip_group(group: list[dict]) -> dict:
+    """Merge a group of consecutive micro-break trips into one trip dict."""
+    if len(group) == 1:
+        return group[0]
+
+    total_dist = sum(t["distance_km"] for t in group)
+    total_fuel = sum(t["fuel_ml"] for t in group)
+
+    # Distance-weighted average for scores and avg_speed
+    def _weighted_avg(field: str, as_int: bool = True):
+        pairs = [(t[field], t["distance_km"]) for t in group if t.get(field) is not None]
+        if not pairs:
+            return None
+        total_w = sum(w for _, w in pairs)
+        if total_w == 0:
+            return None
+        val = sum(v * w for v, w in pairs) / total_w
+        return round(val) if as_int else round(val, 1)
+
+    # Trip category from longest fragment
+    longest = max(group, key=lambda t: t["distance_km"])
+
+    # Countries union
+    all_countries: list[str] = []
+    seen: set[str] = set()
+    for t in group:
+        for c in t.get("countries") or []:
+            if c not in seen:
+                all_countries.append(c)
+                seen.add(c)
+
+    return {
+        "start": group[0]["start"],
+        "end": group[-1]["end"],
+        "duration_sec": sum(t["duration_sec"] for t in group),
+        "distance_km": total_dist,
+        "ev_distance_km": sum(t["ev_distance_km"] for t in group),
+        "fuel_ml": total_fuel,
+        "avg_fuel": round(total_fuel / total_dist * 100, 2) if total_dist > 0 else 0,
+        "start_lat": group[0]["start_lat"],
+        "start_lng": group[0]["start_lng"],
+        "end_lat": group[-1]["end_lat"],
+        "end_lng": group[-1]["end_lng"],
+        "score": _weighted_avg("score"),
+        "score_accel": _weighted_avg("score_accel"),
+        "score_brake": _weighted_avg("score_brake"),
+        "score_constant": _weighted_avg("score_constant"),
+        "score_advice": _weighted_avg("score_advice"),
+        "ev_duration_sec": sum(t["ev_duration_sec"] for t in group),
+        "eco_time_sec": sum(t["eco_time_sec"] for t in group),
+        "eco_distance_m": sum(t["eco_distance_m"] for t in group),
+        "power_time_sec": sum(t["power_time_sec"] for t in group),
+        "power_distance_m": sum(t["power_distance_m"] for t in group),
+        "charge_time_sec": sum(t["charge_time_sec"] for t in group),
+        "charge_distance_m": sum(t["charge_distance_m"] for t in group),
+        "max_speed_kmh": max((t["max_speed_kmh"] for t in group if t.get("max_speed_kmh") is not None), default=None),
+        "avg_speed_kmh": _weighted_avg("avg_speed_kmh", as_int=False),
+        "highway_distance_m": sum(t["highway_distance_m"] for t in group),
+        "highway_duration_sec": sum(t["highway_duration_sec"] for t in group),
+        "idle_duration_sec": sum(t["idle_duration_sec"] for t in group),
+        "night_trip": 1 if any(t.get("night_trip") == 1 for t in group) else 0,
+        "overspeed_distance_m": sum(t["overspeed_distance_m"] for t in group),
+        "overspeed_duration_sec": sum(t["overspeed_duration_sec"] for t in group),
+        "countries": all_countries,
+        "trip_category": longest.get("trip_category"),
+    }
+
+
+def merge_micro_trips(trips: list[dict], max_gap_min: float = 5.0) -> list[dict]:
+    """Merge consecutive trips separated by ≤ max_gap_min minute gaps into single trips."""
+    from datetime import timedelta
+    if not trips:
+        return []
+    max_gap = timedelta(minutes=max_gap_min)
+    result: list[dict] = []
+    group: list[dict] = [trips[0]]
+    for t in trips[1:]:
+        if group[-1]["end"] is not None:
+            gap = t["start"] - group[-1]["end"]
+            if timedelta(0) <= gap <= max_gap:
+                group.append(t)
+                continue
+        result.append(_merge_trip_group(group))
+        group = [t]
+    result.append(_merge_trip_group(group))
+    return result
+
+
 def compute_kpis(trips: list[dict], price_fn=None) -> dict:
     total_dist = sum(t["distance_km"] for t in trips)
     total_ev = sum(t["ev_distance_km"] for t in trips)
@@ -2927,7 +3015,8 @@ function applyTheme(dark) {{
 def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
                                 country_code: str = "PL",
                                 currency_code: str | None = None,
-                                lang: str = "en") -> Path:
+                                lang: str = "en",
+                                merge_gap: float | None = 5.0) -> Path:
     """Build a dashboard HTML for a single vehicle. Returns the output path."""
     vin = vehicle["vin"]
     alias = vehicle["alias"]
@@ -2966,6 +3055,13 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
     print("Loading trips...")
     trips = load_trips(conn, vin, tz_name)
     print(f"  {len(trips)} trips")
+
+    if merge_gap is not None:
+        raw_count = len(trips)
+        trips = merge_micro_trips(trips, max_gap_min=merge_gap)
+        merged = raw_count - len(trips)
+        if merged > 0:
+            print(f"  Merged {merged} fragments → {len(trips)} trips (gap ≤ {merge_gap} min)")
 
     if not trips:
         print(f"  Skipping {alias} — no trips.")
@@ -3045,6 +3141,10 @@ def main():
                         help="Display currency code (default: country's native currency)")
     parser.add_argument("--lang", default="en",
                         help="Dashboard language: en, pl (default: en)")
+    parser.add_argument("--no-merge", action="store_true",
+                        help="Disable micro-trip merging, show raw API trips")
+    parser.add_argument("--merge-gap", type=float, default=5.0,
+                        help="Max gap in minutes for micro-trip merging (default: 5)")
     args = parser.parse_args()
 
     country_code = args.country.upper()
@@ -3097,7 +3197,8 @@ def main():
         path = build_dashboard_for_vehicle(conn, vehicle,
                                            country_code=country_code,
                                            currency_code=args.currency,
-                                           lang=lang)
+                                           lang=lang,
+                                           merge_gap=None if args.no_merge else args.merge_gap)
         if path:
             outputs.append(path)
 
