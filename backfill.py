@@ -131,9 +131,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         );
     """)
 
-    # Add fuel_type column to vehicles table
+    # Add fuel_type and engine_type columns to vehicles table
     try:
         conn.execute("ALTER TABLE vehicles ADD COLUMN fuel_type TEXT DEFAULT 'gasoline'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE vehicles ADD COLUMN engine_type TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
 
@@ -407,25 +411,36 @@ async def process_vehicle(vehicle, conn: sqlite3.Connection, brand_label: str, f
     print(f"Vehicle: {vehicle.alias} ({vin})")
     print(f"{'='*60}")
 
-    # Determine fuel type: env var override > API detection > default
+    # Determine fuel type and engine type: env var override > API detection > default
     fuel_type_env = os.environ.get("CAR_FUEL_TYPE", "").lower()
+    # vehicle.type from pytoyoda: "electric", "full_hybrid", "plug_in_hybrid", or "fuel"
+    vtype = getattr(vehicle, "type", None)
     if fuel_type_env and fuel_type_env in ("gasoline", "diesel", "lpg"):
         fuel_type = fuel_type_env
     else:
-        # Auto-detect from API: vehicle.type returns "electric", "full_hybrid", "plug_in_hybrid", or "fuel"
-        vtype = getattr(vehicle, "type", None)
-        if vtype == "electric":
-            fuel_type = "electric"
-        else:
-            fuel_type = "gasoline"  # hybrids and fuel-only Toyotas are almost all petrol
+        fuel_type = "electric" if vtype == "electric" else "gasoline"
         if fuel_type_env and fuel_type_env not in ("gasoline", "diesel", "lpg", ""):
             print(f"Warning: unknown CAR_FUEL_TYPE '{fuel_type_env}', auto-detected '{fuel_type}'")
-    print(f"  Fuel type: {fuel_type}" + (" (from CAR_FUEL_TYPE)" if fuel_type_env else " (auto-detected)"))
+
+    # Map pytoyoda vehicle.type to our 5-way engine_type taxonomy
+    _engine_type_map = {
+        "electric": "BEV",
+        "plug_in_hybrid": "PHEV",
+        "full_hybrid": "HEV",
+    }
+    if vtype in _engine_type_map:
+        engine_type = _engine_type_map[vtype]
+    elif fuel_type == "diesel":
+        engine_type = "Diesel"
+    else:
+        engine_type = "Petrol"
+
+    print(f"  Fuel type: {fuel_type}, Engine type: {engine_type} (vehicle.type={vtype!r})" + (" (fuel from CAR_FUEL_TYPE)" if fuel_type_env else ""))
 
     # Store vehicle info
     conn.execute(
-        "INSERT OR REPLACE INTO vehicles (vin, alias, brand, fuel_type) VALUES (?, ?, ?, ?)",
-        (vin, vehicle.alias, brand_label, fuel_type),
+        "INSERT OR REPLACE INTO vehicles (vin, alias, brand, fuel_type, engine_type) VALUES (?, ?, ?, ?, ?)",
+        (vin, vehicle.alias, brand_label, fuel_type, engine_type),
     )
     conn.commit()
 

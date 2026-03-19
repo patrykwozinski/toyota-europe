@@ -26,16 +26,16 @@ CO2_KG_PER_LITER = 2.31
 
 
 def load_all_vehicles(conn: sqlite3.Connection) -> list[dict]:
-    """Load all vehicles from DB. Returns list of dicts with 'vin', 'alias', 'brand', 'fuel_type'."""
+    """Load all vehicles from DB. Returns list of dicts with 'vin', 'alias', 'brand', 'fuel_type', 'engine_type'."""
     try:
-        rows = conn.execute("SELECT vin, alias, brand, fuel_type FROM vehicles").fetchall()
+        rows = conn.execute("SELECT vin, alias, brand, fuel_type, engine_type FROM vehicles").fetchall()
         if rows:
-            return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or "", "fuel_type": r[3] or "gasoline"} for r in rows]
+            return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or "", "fuel_type": r[3] or "gasoline", "engine_type": r[4]} for r in rows]
     except sqlite3.OperationalError:
         try:
-            rows = conn.execute("SELECT vin, alias, brand FROM vehicles").fetchall()
+            rows = conn.execute("SELECT vin, alias, brand, fuel_type FROM vehicles").fetchall()
             if rows:
-                return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or "", "fuel_type": "gasoline"} for r in rows]
+                return [{"vin": r[0], "alias": r[1] or "My Car", "brand": r[2] or "", "fuel_type": r[3] or "gasoline", "engine_type": None} for r in rows]
         except sqlite3.OperationalError:
             pass
     return []
@@ -743,10 +743,10 @@ def compute_driving_profile(trips: list[dict], t: dict | None = None) -> dict:
     }
 
 
-def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | None = None) -> dict:
+def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | None = None, fuel_type: str = "gasoline", engine_type: str | None = None) -> dict:
     """Score 5 engine types based on driving patterns and recommend the best fit."""
     if not trips:
-        return {"scores": [], "recommendation": None, "runner_up": None}
+        return {"scores": [], "recommendation": None, "runner_up": None, "current_engine": None}
 
     total_dist = sum(tr["distance_km"] for tr in trips)
     total_dur = sum(tr["duration_sec"] for tr in trips)
@@ -766,7 +766,15 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
     radar = profile.get("radar", {}).get("values", [50, 50, 50, 50, 50])
     smoothness = radar[0] if len(radar) > 0 else 50
     eco_score = radar[1] if len(radar) > 1 else 50
+    speed_discipline = radar[2] if len(radar) > 2 else 50
+    consistency = radar[3] if len(radar) > 3 else 50
     calmness = radar[4] if len(radar) > 4 else 50
+
+    habits = profile.get("habits", {})
+    trips_per_day = habits.get("trips_per_day", 0)
+    weekend_pct = habits.get("weekend_pct", 0)
+
+    driver_class = profile.get("classification", {}).get("label", "")
 
     engines = {
         "BEV": {"label": t["engine_bev"] if t else "Battery Electric", "icon": "battery-full"},
@@ -827,7 +835,7 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
     else:
         f5 = {"BEV": 50, "PHEV": 65, "HEV": 65, "Petrol": 75, "Diesel": 80}
 
-    # Factor 6: Fuel efficiency sensitivity (10%)
+    # Factor 6: Fuel efficiency sensitivity (8%)
     if avg_fuel > 7:
         f6 = {"BEV": 90, "PHEV": 85, "HEV": 80, "Petrol": 40, "Diesel": 55}
     elif avg_fuel > 5:
@@ -835,11 +843,38 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
     else:
         f6 = {"BEV": 60, "PHEV": 70, "HEV": 75, "Petrol": 70, "Diesel": 70}
 
-    weights = [0.30, 0.20, 0.15, 0.15, 0.10, 0.10]
-    factors = [f1, f2, f3, f4, f5, f6]
+    # Factor 7: Speed discipline (8%)
+    if speed_discipline >= 75:
+        f7 = {"BEV": 90, "PHEV": 85, "HEV": 85, "Petrol": 55, "Diesel": 50}
+    elif speed_discipline >= 50:
+        f7 = {"BEV": 70, "PHEV": 75, "HEV": 75, "Petrol": 70, "Diesel": 65}
+    else:  # aggressive speeding
+        f7 = {"BEV": 40, "PHEV": 55, "HEV": 50, "Petrol": 85, "Diesel": 80}
+
+    # Factor 8: Driver classification (8%)
+    if driver_class == "Eco Expert":
+        f8 = {"BEV": 95, "PHEV": 85, "HEV": 85, "Petrol": 30, "Diesel": 25}
+    elif driver_class == "City Navigator":
+        f8 = {"BEV": 90, "PHEV": 80, "HEV": 85, "Petrol": 45, "Diesel": 25}
+    elif driver_class == "Smooth Cruiser":
+        f8 = {"BEV": 80, "PHEV": 80, "HEV": 85, "Petrol": 60, "Diesel": 50}
+    elif driver_class == "Highway Warrior":
+        f8 = {"BEV": 40, "PHEV": 60, "HEV": 55, "Petrol": 80, "Diesel": 90}
+    elif driver_class == "Spirited Driver":
+        f8 = {"BEV": 35, "PHEV": 50, "HEV": 45, "Petrol": 90, "Diesel": 75}
+    else:  # Balanced Driver / Unknown
+        f8 = {"BEV": 65, "PHEV": 75, "HEV": 75, "Petrol": 70, "Diesel": 65}
+
+    weights = [0.25, 0.18, 0.12, 0.12, 0.09, 0.08, 0.08, 0.08]
+    factors = [f1, f2, f3, f4, f5, f6, f7, f8]
     for eng in engines:
-        total = sum(factors[i][eng] * weights[i] for i in range(6))
+        total = sum(factors[i][eng] * weights[i] for i in range(8))
         scores[eng] = round(total, 1)
+
+    # BEV range gate: penalise if any single trip exceeds 300 km
+    max_trip_km = max(tr["distance_km"] for tr in trips)
+    if max_trip_km > 300:
+        scores["BEV"] = max(0, round(scores["BEV"] - 15, 1))
 
     sorted_engines = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     top_eng = sorted_engines[0][0]
@@ -878,6 +913,16 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
     if avg_fuel > 6:
         reasons_map["HEV"].append((t["reason_hev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a hybrid could cut consumption by 20-30%").format(fuel=avg_fuel))
         reasons_map["PHEV"].append((t["reason_phev_fuel_savings"] if t else "At {fuel:.1f} L/100km, a PHEV could slash your fuel costs").format(fuel=avg_fuel))
+    if trips_per_day >= 2:
+        reasons_map["BEV"].append((t["reason_bev_daily_trips"] if t else "Your {n:.1f} daily trips are ideal for overnight home charging").format(n=trips_per_day))
+    if weekend_pct > 60:
+        reasons_map["PHEV"].append(t["reason_phev_weekend"] if t else "Weekend-heavy use benefits from petrol backup on longer leisure trips")
+    if speed_discipline < 50:
+        reasons_map["Petrol"].append(t["reason_petrol_speed"] if t else "Your frequent high-speed driving suits petrol's broad RPM range")
+    if consistency >= 70:
+        reasons_map["BEV"].append(t["reason_bev_consistency"] if t else "Your consistent driving routine makes home charging planning easy")
+    if max_trip_km > 300:
+        reasons_map["BEV"].append(t["reason_bev_long_trip_note"] if t else "Note: your longest recorded trip exceeds 300 km — BEV charging stops required")
 
     # Fallback reasons
     if not reasons_map["BEV"]:
@@ -900,16 +945,73 @@ def compute_engine_recommendation(trips: list[dict], profile: dict, t: dict | No
         "Diesel": t["tradeoff_diesel"] if t else "Higher emissions in city; declining resale value in some markets",
     }
 
+    # Why Not reasons (dynamic, profile-aware negatives)
+    why_not_map: dict[str, list[str]] = {"BEV": [], "PHEV": [], "HEV": [], "Petrol": [], "Diesel": []}
+
+    if max_trip_km > 300:
+        why_not_map["BEV"].append((t["why_not_bev_long_trip"] if t else "Your longest trip ({km:.0f} km) would require a mid-journey charging stop").format(km=max_trip_km))
+    if highway_pct > 60:
+        why_not_map["BEV"].append((t["why_not_bev_highway"] if t else "{pct:.0f}% highway driving reduces BEV range and regeneration efficiency").format(pct=highway_pct))
+    if speed_discipline < 50:
+        why_not_map["BEV"].append(t["why_not_bev_speed"] if t else "Frequent high-speed driving significantly drains the battery")
+    if not why_not_map["BEV"]:
+        why_not_map["BEV"].append(tradeoffs_map["BEV"])
+
+    if ev_pct < 5 and total_dist > 5000:
+        why_not_map["PHEV"].append(t["why_not_phev_no_charging"] if t else "Without regular plugging-in, a PHEV effectively becomes a heavy petrol car")
+    if avg_trip_km > 80:
+        why_not_map["PHEV"].append((t["why_not_phev_long_avg"] if t else "Long trips of {km:.0f} km average will mostly run on petrol, limiting EV benefit").format(km=avg_trip_km))
+    if not why_not_map["PHEV"]:
+        why_not_map["PHEV"].append(tradeoffs_map["PHEV"])
+
+    if ev_pct > 20:
+        why_not_map["HEV"].append(t["why_not_hev_ev_appetite"] if t else "Your EV appetite would be better served by a PHEV's larger battery")
+    if highway_pct > 60:
+        why_not_map["HEV"].append(t["why_not_hev_highway"] if t else "Highway-heavy driving reduces hybrid regeneration benefit")
+    if not why_not_map["HEV"]:
+        why_not_map["HEV"].append(tradeoffs_map["HEV"])
+
+    if short_trip_pct > 50:
+        why_not_map["Petrol"].append((t["why_not_petrol_short_trips"] if t else "{pct:.0f}% short trips cause cold-start engine wear and poor efficiency").format(pct=short_trip_pct))
+    if city_pct > 70:
+        why_not_map["Petrol"].append((t["why_not_petrol_city"] if t else "{pct:.0f}% city driving will hurt petrol fuel economy vs a hybrid").format(pct=city_pct))
+    if smoothness >= 75 and eco_score >= 60:
+        why_not_map["Petrol"].append(t["why_not_petrol_eco"] if t else "Your eco-conscious style is better rewarded in an electrified powertrain")
+    if not why_not_map["Petrol"]:
+        why_not_map["Petrol"].append(tradeoffs_map["Petrol"])
+
+    if city_pct > 70:
+        why_not_map["Diesel"].append((t["why_not_diesel_city"] if t else "{pct:.0f}% city driving risks DPF clogging and high urban NOx emissions").format(pct=city_pct))
+    if short_trip_pct > 50:
+        why_not_map["Diesel"].append(t["why_not_diesel_short"] if t else "Short trips damage diesel DPF filters and increase cold-start wear")
+    if avg_trip_km < 30:
+        why_not_map["Diesel"].append((t["why_not_diesel_avg_short"] if t else "Diesel efficiency gains only appear on sustained runs — your {km:.0f} km average is too short").format(km=avg_trip_km))
+    if not why_not_map["Diesel"]:
+        why_not_map["Diesel"].append(tradeoffs_map["Diesel"])
+
     result_scores = []
     for eng, score in sorted_engines:
         result_scores.append({
             "type": eng,
             "label": engines[eng]["label"],
             "score": score,
+            "reasons": reasons_map[eng][:4],
+            "why_not": why_not_map[eng][:3],
         })
+
+    # Determine current engine type: prefer explicit DB value, fall back to heuristic
+    if engine_type in ("BEV", "PHEV", "HEV", "Petrol", "Diesel"):
+        current_engine = engine_type
+    elif fuel_type == "diesel":
+        current_engine = "Diesel"
+    elif ev_pct > 0:
+        current_engine = "HEV"
+    else:
+        current_engine = "Petrol"
 
     return {
         "scores": result_scores,
+        "current_engine": current_engine,
         "recommendation": {
             "type": top_eng,
             "label": engines[top_eng]["label"],
@@ -956,7 +1058,7 @@ def build_html(kpis, monthly, weekday_hour, score_dist, heatmap_layers, longest_
 
     # Build JS translation subset (js_* keys + a few extras needed in chart labels)
     js_t = {k[3:]: v for k, v in (t or {}).items() if k.startswith("js_")}
-    for extra_key in ("night", "day", "highway", "city_other", "best_match", "runner_up", "tradeoffs_label"):
+    for extra_key in ("night", "day", "highway", "city_other", "best_match", "runner_up", "tradeoffs_label", "why_yes_label", "why_not_label", "your_car"):
         if t and extra_key in t:
             js_t[extra_key] = t[extra_key]
 
@@ -1407,28 +1509,6 @@ tailwind.config = {{
     </div>
   </div>
 
-  <!-- Speed Profile + Road Type -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-    <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">{t["speed_profile_title"]}</h3>
-      <canvas id="speedProfileChart"></canvas>
-    </div>
-    <div class="card">
-      <h3 class="text-lg font-semibold text-heading mb-4">{t["road_type_split"]}</h3>
-      <div style="max-width:280px;margin:0 auto"><canvas id="roadTypeChart"></canvas></div>
-      <div class="grid grid-cols-2 gap-4 mt-4 text-center text-sm">
-        <div>
-          <div class="text-2xl font-bold text-heading" id="highwayPctVal"></div>
-          <div class="text-muted">{t["highway"]}</div>
-        </div>
-        <div>
-          <div class="text-2xl font-bold text-heading" id="cityPctVal"></div>
-          <div class="text-muted">{t["city_other"]}</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <!-- Trip Distance Distribution + Habits -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <div class="card">
@@ -1454,6 +1534,14 @@ tailwind.config = {{
           <div class="text-2xl font-bold text-heading" id="habitPeakHour"></div>
           <div class="text-sm text-muted">{t["habit_peak_hour"]}</div>
         </div>
+        <div class="rounded-xl p-4" style="background:var(--bg-body)">
+          <div class="text-2xl font-bold text-heading" id="highwayPctVal"></div>
+          <div class="text-sm text-muted">{t["highway"]}</div>
+        </div>
+        <div class="rounded-xl p-4" style="background:var(--bg-body)">
+          <div class="text-2xl font-bold text-heading" id="cityPctVal"></div>
+          <div class="text-sm text-muted">{t["city_other"]}</div>
+        </div>
       </div>
     </div>
   </div>
@@ -1462,7 +1550,7 @@ tailwind.config = {{
   <div class="card mb-8">
     <h3 class="text-lg font-semibold text-heading mb-6">{t["engine_type_recommendation"]}</h3>
     <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 mb-8" id="engineScores"></div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6" id="engineCards"></div>
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6" id="engineCards"></div>
   </div>
   </div><!-- /tab-profile -->
 
@@ -2123,51 +2211,6 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
     }}
   }});
 
-  // Speed profile bar chart
-  const speedColors = ['#22c55e','#84cc16','#eab308','#f97316','#ef4444','#dc2626'];
-  createChart('speedProfileChart', {{
-    type: 'bar',
-    data: {{
-      labels: D.drivingProfile.speedProfile.labels,
-      datasets: [{{
-        label: T.trips,
-        data: D.drivingProfile.speedProfile.counts,
-        backgroundColor: speedColors,
-        borderRadius: 6,
-      }}]
-    }},
-    options: {{
-      responsive: true,
-      plugins: {{ legend: {{ display: false }} }},
-      scales: {{
-        y: {{ title: {{ display: true, text: T.trips }}, grid: {{ color: gridColor }} }},
-        x: {{ title: {{ display: true, text: T.avg_speed_kmh }}, grid: {{ display: false }} }}
-      }}
-    }}
-  }});
-
-  // Road type doughnut
-  createChart('roadTypeChart', {{
-    type: 'doughnut',
-    data: {{
-      labels: [T.highway, T.city_other],
-      datasets: [{{
-        data: [D.drivingProfile.roadType.highway_pct, D.drivingProfile.roadType.city_pct],
-        backgroundColor: ['#3b82f6','#f59e0b'],
-        borderWidth: 0,
-      }}]
-    }},
-    options: {{
-      responsive: true,
-      plugins: {{
-        legend: {{ position: 'bottom', labels: {{ padding: 8, font: {{ size: 11 }} }} }},
-        tooltip: {{ callbacks: {{ label: ctx => ctx.label + ': ' + ctx.parsed + '%' }} }}
-      }}
-    }}
-  }});
-  document.getElementById('highwayPctVal').textContent = D.drivingProfile.roadType.highway_pct + '%';
-  document.getElementById('cityPctVal').textContent = D.drivingProfile.roadType.city_pct + '%';
-
   // Trip distance distribution
   createChart('tripDistChart', {{
     type: 'bar',
@@ -2195,6 +2238,8 @@ if (D.drivingProfile && D.drivingProfile.radar) {{
   document.getElementById('habitWeekend').textContent = D.drivingProfile.habits.weekend_pct + '%';
   document.getElementById('habitTripsDay').textContent = D.drivingProfile.habits.trips_per_day;
   document.getElementById('habitPeakHour').textContent = D.drivingProfile.habits.peak_hour;
+  document.getElementById('highwayPctVal').textContent = D.drivingProfile.roadType.highway_pct + '%';
+  document.getElementById('cityPctVal').textContent = D.drivingProfile.roadType.city_pct + '%';
 }}
 
 // --- Engine Recommendation ---
@@ -2218,40 +2263,36 @@ if (D.engineRecommendation && D.engineRecommendation.scores) {{
   }});
 
   const cards = document.getElementById('engineCards');
-  const rec = D.engineRecommendation.recommendation;
-  if (rec) {{
-    const recDiv = document.createElement('div');
-    recDiv.className = 'rounded-xl p-6 border-2 border-lexus-600';
-    recDiv.style.background = 'var(--bg-body)';
-    const reasonsHtml = rec.reasons.map(r => `<li class="flex items-start gap-2"><span class="text-lexus-600 mt-0.5">&#10003;</span><span>${{r}}</span></li>`).join('');
-    recDiv.innerHTML = `
-      <div class="flex items-center gap-3 mb-4">
-        <span class="px-3 py-1 rounded-full text-sm font-semibold bg-lexus-600 text-white">${{T.best_match}}</span>
-        <span class="text-xl font-bold text-heading">${{rec.label}} (${{rec.type}})</span>
-        <span class="text-lg font-semibold text-muted ml-auto">${{rec.score}}/100</span>
+  const badgeLabels = [T.best_match, T.runner_up, '#3', '#4', '#5'];
+  const currentEngine = D.engineRecommendation.current_engine;
+  D.engineRecommendation.scores.forEach((eng, i) => {{
+    const isTop = i === 0;
+    const isCurrent = eng.type === currentEngine;
+    const card = document.createElement('div');
+    card.className = 'rounded-xl p-6' + (isTop ? ' ring-2 ring-lexus-600' : '');
+    card.style.background = 'var(--bg-body)';
+    if (!isTop) card.style.border = '1px solid var(--border-card)';
+    const barColor = typeColors[eng.type] || '#917f65';
+    const badgeClass = isTop ? 'bg-lexus-600 text-white' : 'heat-btn-inactive';
+    const yourCarBadge = isCurrent ? `<span class="px-2 py-0.5 rounded-full text-xs font-semibold border border-amber-400 text-amber-600">${{T.your_car || 'Your Car'}}</span>` : '';
+    const reasonsHtml = (eng.reasons || []).map(r => `<li class="flex items-start gap-2"><span class="text-lexus-600 mt-0.5">&#10003;</span><span>${{r}}</span></li>`).join('');
+    const whyNotHtml = (eng.why_not || []).map(r => `<li class="flex items-start gap-2"><span class="text-muted mt-0.5">&#10007;</span><span>${{r}}</span></li>`).join('');
+    card.innerHTML = `
+      <div class="flex items-center gap-3 mb-3 flex-wrap">
+        <span class="px-3 py-1 rounded-full text-sm font-semibold ${{badgeClass}}">${{badgeLabels[i] || ('#' + (i+1))}}</span>
+        ${{yourCarBadge}}
+        <span class="font-bold text-heading">${{eng.label}} (${{eng.type}})</span>
+        <span class="text-sm font-semibold text-muted ml-auto">${{eng.score}}/100</span>
       </div>
-      <ul class="space-y-2 text-sm text-heading mb-4">${{reasonsHtml}}</ul>
-      <p class="text-xs text-muted"><strong>${{T.tradeoffs_label}}</strong> ${{rec.tradeoffs}}</p>`;
-    cards.appendChild(recDiv);
-  }}
-
-  const ru = D.engineRecommendation.runner_up;
-  if (ru) {{
-    const ruDiv = document.createElement('div');
-    ruDiv.className = 'rounded-xl p-6';
-    ruDiv.style.background = 'var(--bg-body)';
-    ruDiv.style.border = '1px solid var(--border-card)';
-    const ruReasonsHtml = ru.reasons.map(r => `<li class="flex items-start gap-2"><span class="text-muted mt-0.5">&#10003;</span><span>${{r}}</span></li>`).join('');
-    ruDiv.innerHTML = `
-      <div class="flex items-center gap-3 mb-4">
-        <span class="px-3 py-1 rounded-full text-sm font-semibold heat-btn-inactive">${{T.runner_up}}</span>
-        <span class="text-xl font-bold text-heading">${{ru.label}} (${{ru.type}})</span>
-        <span class="text-lg font-semibold text-muted ml-auto">${{ru.score}}/100</span>
+      <div class="w-full rounded-full h-1.5 mb-4" style="background:var(--border-card)">
+        <div class="h-1.5 rounded-full" style="width:${{eng.score}}%;background:${{barColor}}"></div>
       </div>
-      <ul class="space-y-2 text-sm text-heading mb-4">${{ruReasonsHtml}}</ul>
-      <p class="text-xs text-muted"><strong>${{T.tradeoffs_label}}</strong> ${{ru.tradeoffs}}</p>`;
-    cards.appendChild(ruDiv);
-  }}
+      <div class="text-xs font-semibold text-lexus-600 mb-1">${{T.why_yes_label || 'WHY YES'}}</div>
+      <ul class="space-y-1 text-sm text-heading mb-3">${{reasonsHtml}}</ul>
+      <div class="text-xs font-semibold text-muted mb-1">${{T.why_not_label || 'WHY NOT'}}</div>
+      <ul class="space-y-1 text-sm text-muted">${{whyNotHtml}}</ul>`;
+    cards.appendChild(card);
+  }});
 }}
 
 // --- Tab Navigation ---
@@ -2397,7 +2438,7 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
     nd = compute_night_driving(trips)
     idle = compute_idle_analysis(trips)
     profile = compute_driving_profile(trips, t)
-    engine_rec = compute_engine_recommendation(trips, profile, t)
+    engine_rec = compute_engine_recommendation(trips, profile, t, fuel_type=fuel_type, engine_type=vehicle.get("engine_type"))
 
     print("Building HTML...")
     html = build_html(kpis, monthly, wh, sd, heatmap_layers, lt, tc, sea, trips,

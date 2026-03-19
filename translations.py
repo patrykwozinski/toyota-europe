@@ -118,6 +118,9 @@ TRANSLATIONS = {
         "best_match": "Best Match",
         "runner_up": "Runner-up",
         "tradeoffs_label": "Trade-offs:",
+        "why_yes_label": "WHY YES",
+        "why_not_label": "WHY NOT",
+        "your_car": "Your Car",
 
         # Night/Day labels
         "night": "Night",
@@ -194,6 +197,26 @@ TRANSLATIONS = {
         "reason_petrol_spirited": "Your spirited driving style pairs well with responsive petrol engines",
         "reason_hev_fuel_savings": "At {fuel:.1f} L/100km, a hybrid could cut consumption by 20-30%",
         "reason_phev_fuel_savings": "At {fuel:.1f} L/100km, a PHEV could slash your fuel costs",
+        "reason_bev_daily_trips": "Your {n:.1f} daily trips are ideal for overnight home charging",
+        "reason_phev_weekend": "Weekend-heavy use benefits from petrol backup on longer leisure trips",
+        "reason_petrol_speed": "Your frequent high-speed driving suits petrol's broad RPM range",
+        "reason_bev_consistency": "Your consistent driving routine makes home charging planning easy",
+        "reason_bev_long_trip_note": "Note: your longest recorded trip exceeds 300 km — BEV charging stops required",
+
+        # Why Not reasons
+        "why_not_bev_long_trip": "Your longest trip ({km:.0f} km) would require a mid-journey charging stop",
+        "why_not_bev_highway": "{pct:.0f}% highway driving reduces BEV range and regeneration efficiency",
+        "why_not_bev_speed": "Frequent high-speed driving significantly drains the battery",
+        "why_not_phev_no_charging": "Without regular plugging-in, a PHEV effectively becomes a heavy petrol car",
+        "why_not_phev_long_avg": "Long trips of {km:.0f} km average will mostly run on petrol, limiting EV benefit",
+        "why_not_hev_ev_appetite": "Your EV appetite would be better served by a PHEV's larger battery",
+        "why_not_hev_highway": "Highway-heavy driving reduces hybrid regeneration benefit",
+        "why_not_petrol_short_trips": "{pct:.0f}% short trips cause cold-start engine wear and poor efficiency",
+        "why_not_petrol_city": "{pct:.0f}% city driving will hurt petrol fuel economy vs a hybrid",
+        "why_not_petrol_eco": "Your eco-conscious style is better rewarded in an electrified powertrain",
+        "why_not_diesel_city": "{pct:.0f}% city driving risks DPF clogging and high urban NOx emissions",
+        "why_not_diesel_short": "Short trips damage diesel DPF filters and increase cold-start wear",
+        "why_not_diesel_avg_short": "Diesel efficiency gains only appear on sustained runs — your {km:.0f} km average is too short",
 
         # Engine fallback reasons
         "reason_bev_fallback_1": "Zero emissions and lowest running costs",
@@ -355,6 +378,9 @@ TRANSLATIONS = {
         "best_match": "Najlepsze dopasowanie",
         "runner_up": "Druga opcja",
         "tradeoffs_label": "Kompromisy:",
+        "why_yes_label": "DLACZEGO TAK",
+        "why_not_label": "DLACZEGO NIE",
+        "your_car": "Twój samochód",
 
         # Night/Day labels
         "night": "Noc",
@@ -431,6 +457,26 @@ TRANSLATIONS = {
         "reason_petrol_spirited": "Twój dynamiczny styl jazdy świetnie pasuje do responsywnych silników benzynowych",
         "reason_hev_fuel_savings": "Przy {fuel:.1f} L/100km hybryda mogłaby zmniejszyć zużycie o 20-30%",
         "reason_phev_fuel_savings": "Przy {fuel:.1f} L/100km PHEV może drastycznie obniżyć koszty paliwa",
+        "reason_bev_daily_trips": "Twoje {n:.1f} dziennych podróży idealnie wpisuje się w nocne ładowanie w domu",
+        "reason_phev_weekend": "Weekendowe wyjazdy czerpią z zapasu paliwowego na dłuższych trasach",
+        "reason_petrol_speed": "Twój częsty szybki styl jazdy pasuje do szerokiego zakresu obrotów benzynówki",
+        "reason_bev_consistency": "Twój przewidywalny rytm jazdy ułatwia planowanie ładowania w domu",
+        "reason_bev_long_trip_note": "Uwaga: Twoja najdłuższa trasa przekracza 300 km — BEV wymagałby postoju na ładowanie",
+
+        # Why Not reasons
+        "why_not_bev_long_trip": "Twoja najdłuższa podróż ({km:.0f} km) wymagałaby postoju na ładowanie w trasie",
+        "why_not_bev_highway": "{pct:.0f}% jazdy autostradowej ogranicza zasięg BEV i efektywność rekuperacji",
+        "why_not_bev_speed": "Częsta jazda z wysoką prędkością znacząco drenuje baterię",
+        "why_not_phev_no_charging": "Bez regularnego ładowania PHEV staje się de facto ciężką benzynówką",
+        "why_not_phev_long_avg": "Długie podróże (średnio {km:.0f} km) będą jeździć głównie na benzynie, ograniczając korzyści EV",
+        "why_not_hev_ev_appetite": "Twój apetyt na elektryczność lepiej zaspokoi większa bateria PHEV",
+        "why_not_hev_highway": "Jazda głównie autostradą ogranicza korzyści z rekuperacji hybrydy",
+        "why_not_petrol_short_trips": "{pct:.0f}% krótkich podróży powoduje zużycie silnika na zimno i słabą wydajność",
+        "why_not_petrol_city": "{pct:.0f}% jazdy miejskiej pogorszy ekonomię paliwową benzyny w porównaniu z hybrydą",
+        "why_not_petrol_eco": "Twój ekologiczny styl jazdy jest lepiej nagradzany w elektryfikowanym napędzie",
+        "why_not_diesel_city": "{pct:.0f}% jazdy miejskiej grozi zapychaniem filtra DPF i wysoką emisją NOx w mieście",
+        "why_not_diesel_short": "Krótkie podróże niszczą filtr DPF diesla i zwiększają zużycie na zimnym silniku",
+        "why_not_diesel_avg_short": "Diesel oszczędza tylko na długich trasach — Twoja średnia {km:.0f} km jest za krótka",
 
         # Engine fallback reasons
         "reason_bev_fallback_1": "Zerowa emisja i najniższe koszty eksploatacji",
