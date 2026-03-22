@@ -129,7 +129,7 @@ def load_enriched_waypoints(conn: sqlite3.Connection, vin: str,
         # Original SQL-only approach
         def _query(extra_where=""):
             base = (
-                "SELECT ROUND(w.lat, 4) AS rlat, ROUND(w.lng, 4) AS rlng, COUNT(*) AS cnt "
+                "SELECT ROUND(w.lat, 4) AS rlat, ROUND(w.lng, 4) AS rlng, COUNT(DISTINCT w.trip_start_time) AS cnt "
                 "FROM waypoints w JOIN trips t ON w.trip_start_time = t.trip_start_time "
                 "WHERE t.vin = ?"
             )
@@ -156,10 +156,10 @@ def load_enriched_waypoints(conn: sqlite3.Connection, vin: str,
         (vin,),
     ).fetchall()
 
-    acc_all = defaultdict(float)
-    acc_ev = defaultdict(float)
-    acc_hw = defaultdict(float)
-    acc_os = defaultdict(float)
+    acc_all = defaultdict(set)
+    acc_ev = defaultdict(set)
+    acc_hw = defaultdict(set)
+    acc_os = defaultdict(set)
 
     prev = None
     for r in rows:
@@ -173,43 +173,41 @@ def load_enriched_waypoints(conn: sqlite3.Connection, vin: str,
             if dist <= MAX_INTERP_GRID_DIST:
                 # Interpolate — flags inherited from start waypoint (prev)
                 p_os, p_hw, p_ev = prev[2], prev[3], prev[4]
-                seg_len = max(abs(lat_grid - plat), abs(lng_grid - plng)) + 1
-                weight = 1.0 / seg_len
                 for gx, gy in _bresenham(plat, plng, lat_grid, lng_grid):
                     cell = (gx, gy)
-                    acc_all[cell] += weight
+                    acc_all[cell].add(trip_id)
                     if p_ev:
-                        acc_ev[cell] += weight
+                        acc_ev[cell].add(trip_id)
                     if p_hw:
-                        acc_hw[cell] += weight
+                        acc_hw[cell].add(trip_id)
                     if p_os:
-                        acc_os[cell] += weight
+                        acc_os[cell].add(trip_id)
             else:
                 # GPS anomaly — count only the current endpoint
                 cell = (lat_grid, lng_grid)
-                acc_all[cell] += 1.0
+                acc_all[cell].add(trip_id)
                 if is_ev:
-                    acc_ev[cell] += 1.0
+                    acc_ev[cell].add(trip_id)
                 if highway:
-                    acc_hw[cell] += 1.0
+                    acc_hw[cell].add(trip_id)
                 if overspeed:
-                    acc_os[cell] += 1.0
+                    acc_os[cell].add(trip_id)
         else:
             # First point of a trip
             cell = (lat_grid, lng_grid)
-            acc_all[cell] += 1.0
+            acc_all[cell].add(trip_id)
             if is_ev:
-                acc_ev[cell] += 1.0
+                acc_ev[cell].add(trip_id)
             if highway:
-                acc_hw[cell] += 1.0
+                acc_hw[cell].add(trip_id)
             if overspeed:
-                acc_os[cell] += 1.0
+                acc_os[cell].add(trip_id)
 
         prev = (lat_grid, lng_grid, overspeed, highway, is_ev, trip_id)
 
     def _to_list(acc):
-        return [[gx / 10000, gy / 10000, round(math.log1p(cnt), 4)]
-                for (gx, gy), cnt in acc.items()]
+        return [[gx / 10000, gy / 10000, round(math.log1p(len(trips)), 4)]
+                for (gx, gy), trips in acc.items()]
 
     return {
         "all": _to_list(acc_all),
