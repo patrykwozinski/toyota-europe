@@ -24,6 +24,30 @@ DB_PATH = Path(__file__).parent / "trips.db"
 # CO2 emission factor for gasoline: 2.31 kg CO2 per liter
 CO2_KG_PER_LITER = 2.31
 
+# Max grid distance (in 4dp units, ~500m) for heatmap interpolation.
+# Segments longer than this are GPS anomalies — skip interpolation.
+MAX_INTERP_GRID_DIST = 45
+
+
+def _bresenham(x0: int, y0: int, x1: int, y1: int):
+    """Yield integer grid cells along a Bresenham line from (x0,y0) to (x1,y1)."""
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
 
 def load_all_vehicles(conn: sqlite3.Connection) -> list[dict]:
     """Load all vehicles from DB. Returns list of dicts with 'vin', 'alias', 'brand', 'fuel_type', 'engine_type'."""
@@ -94,25 +118,102 @@ def load_trips(conn: sqlite3.Connection, vin: str, tz_name: str = "Europe/Warsaw
     return result
 
 
-def load_enriched_waypoints(conn: sqlite3.Connection, vin: str) -> dict:
-    """Load waypoints grouped by type for layered heatmap, filtered by VIN."""
-    def _query(extra_where=""):
-        base = (
-            "SELECT ROUND(w.lat, 4) AS rlat, ROUND(w.lng, 4) AS rlng, COUNT(*) AS cnt "
-            "FROM waypoints w JOIN trips t ON w.trip_start_time = t.trip_start_time "
-            "WHERE t.vin = ?"
-        )
-        if extra_where:
-            base += f" AND {extra_where}"
-        base += " GROUP BY rlat, rlng"
-        rows = conn.execute(base, (vin,)).fetchall()
-        return [[r[0], r[1], math.log1p(r[2])] for r in rows]
+def load_enriched_waypoints(conn: sqlite3.Connection, vin: str,
+                            interpolate: bool = True) -> dict:
+    """Load waypoints grouped by type for layered heatmap, filtered by VIN.
+
+    When interpolate=True, fills gaps between consecutive waypoints within each
+    trip using Bresenham line drawing on the 4-decimal-place grid.
+    """
+    if not interpolate:
+        # Original SQL-only approach
+        def _query(extra_where=""):
+            base = (
+                "SELECT ROUND(w.lat, 4) AS rlat, ROUND(w.lng, 4) AS rlng, COUNT(*) AS cnt "
+                "FROM waypoints w JOIN trips t ON w.trip_start_time = t.trip_start_time "
+                "WHERE t.vin = ?"
+            )
+            if extra_where:
+                base += f" AND {extra_where}"
+            base += " GROUP BY rlat, rlng"
+            rows = conn.execute(base, (vin,)).fetchall()
+            return [[r[0], r[1], round(math.log1p(r[2]), 4)] for r in rows]
+
+        return {
+            "all": _query(),
+            "ev": _query("w.is_ev = 1"),
+            "highway": _query("w.highway = 1"),
+            "overspeed": _query("w.overspeed = 1"),
+        }
+
+    # Interpolated approach: Bresenham between consecutive waypoints
+    rows = conn.execute(
+        "SELECT ROUND(w.lat, 4), ROUND(w.lng, 4), w.overspeed, w.highway, w.is_ev, "
+        "       w.trip_start_time "
+        "FROM waypoints w JOIN trips t ON w.trip_start_time = t.trip_start_time "
+        "WHERE t.vin = ? "
+        "ORDER BY w.trip_start_time, w.idx",
+        (vin,),
+    ).fetchall()
+
+    acc_all = defaultdict(int)
+    acc_ev = defaultdict(int)
+    acc_hw = defaultdict(int)
+    acc_os = defaultdict(int)
+
+    prev = None
+    for r in rows:
+        lat_grid = round(r[0] * 10000)
+        lng_grid = round(r[1] * 10000)
+        overspeed, highway, is_ev, trip_id = r[2], r[3], r[4], r[5]
+
+        if prev is not None and prev[5] == trip_id:
+            plat, plng = prev[0], prev[1]
+            dist = max(abs(lat_grid - plat), abs(lng_grid - plng))
+            if dist <= MAX_INTERP_GRID_DIST:
+                # Interpolate — flags inherited from start waypoint (prev)
+                p_os, p_hw, p_ev = prev[2], prev[3], prev[4]
+                for gx, gy in _bresenham(plat, plng, lat_grid, lng_grid):
+                    cell = (gx, gy)
+                    acc_all[cell] += 1
+                    if p_ev:
+                        acc_ev[cell] += 1
+                    if p_hw:
+                        acc_hw[cell] += 1
+                    if p_os:
+                        acc_os[cell] += 1
+            else:
+                # GPS anomaly — count only the current endpoint
+                cell = (lat_grid, lng_grid)
+                acc_all[cell] += 1
+                if is_ev:
+                    acc_ev[cell] += 1
+                if highway:
+                    acc_hw[cell] += 1
+                if overspeed:
+                    acc_os[cell] += 1
+        else:
+            # First point of a trip
+            cell = (lat_grid, lng_grid)
+            acc_all[cell] += 1
+            if is_ev:
+                acc_ev[cell] += 1
+            if highway:
+                acc_hw[cell] += 1
+            if overspeed:
+                acc_os[cell] += 1
+
+        prev = (lat_grid, lng_grid, overspeed, highway, is_ev, trip_id)
+
+    def _to_list(acc):
+        return [[gx / 10000, gy / 10000, round(math.log1p(cnt), 4)]
+                for (gx, gy), cnt in acc.items()]
 
     return {
-        "all": _query(),
-        "ev": _query("w.is_ev = 1"),
-        "highway": _query("w.highway = 1"),
-        "overspeed": _query("w.overspeed = 1"),
+        "all": _to_list(acc_all),
+        "ev": _to_list(acc_ev),
+        "highway": _to_list(acc_hw),
+        "overspeed": _to_list(acc_os),
     }
 
 
@@ -3016,7 +3117,8 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
                                 country_code: str = "PL",
                                 currency_code: str | None = None,
                                 lang: str = "en",
-                                merge_gap: float | None = 5.0) -> Path:
+                                merge_gap: float | None = 5.0,
+                                interpolate: bool = True) -> Path:
     """Build a dashboard HTML for a single vehicle. Returns the output path."""
     vin = vehicle["vin"]
     alias = vehicle["alias"]
@@ -3068,7 +3170,7 @@ def build_dashboard_for_vehicle(conn: sqlite3.Connection, vehicle: dict,
         return None
 
     print("Loading heatmap waypoints...")
-    heatmap_layers = load_enriched_waypoints(conn, vin)
+    heatmap_layers = load_enriched_waypoints(conn, vin, interpolate=interpolate)
     print(f"  {len(heatmap_layers['all'])} grid cells (all), {len(heatmap_layers['ev'])} (EV), "
           f"{len(heatmap_layers['highway'])} (highway), {len(heatmap_layers['overspeed'])} (overspeed)")
 
@@ -3145,6 +3247,8 @@ def main():
                         help="Disable micro-trip merging, show raw API trips")
     parser.add_argument("--merge-gap", type=float, default=5.0,
                         help="Max gap in minutes for micro-trip merging (default: 5)")
+    parser.add_argument("--no-interpolate", action="store_true",
+                        help="Disable heatmap waypoint interpolation")
     args = parser.parse_args()
 
     country_code = args.country.upper()
@@ -3198,7 +3302,8 @@ def main():
                                            country_code=country_code,
                                            currency_code=args.currency,
                                            lang=lang,
-                                           merge_gap=None if args.no_merge else args.merge_gap)
+                                           merge_gap=None if args.no_merge else args.merge_gap,
+                                           interpolate=not args.no_interpolate)
         if path:
             outputs.append(path)
 

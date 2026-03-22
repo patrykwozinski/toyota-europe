@@ -38,6 +38,9 @@ python build_dashboard.py --no-merge
 
 # Dashboard with custom merge gap (default: 5 minutes)
 python build_dashboard.py --merge-gap 10
+
+# Dashboard without heatmap interpolation (discrete waypoints only)
+python build_dashboard.py --no-interpolate
 ```
 
 ## Architecture
