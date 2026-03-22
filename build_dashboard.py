@@ -156,10 +156,10 @@ def load_enriched_waypoints(conn: sqlite3.Connection, vin: str,
         (vin,),
     ).fetchall()
 
-    acc_all = defaultdict(int)
-    acc_ev = defaultdict(int)
-    acc_hw = defaultdict(int)
-    acc_os = defaultdict(int)
+    acc_all = defaultdict(float)
+    acc_ev = defaultdict(float)
+    acc_hw = defaultdict(float)
+    acc_os = defaultdict(float)
 
     prev = None
     for r in rows:
@@ -173,35 +173,37 @@ def load_enriched_waypoints(conn: sqlite3.Connection, vin: str,
             if dist <= MAX_INTERP_GRID_DIST:
                 # Interpolate — flags inherited from start waypoint (prev)
                 p_os, p_hw, p_ev = prev[2], prev[3], prev[4]
+                seg_len = max(abs(lat_grid - plat), abs(lng_grid - plng)) + 1
+                weight = 1.0 / seg_len
                 for gx, gy in _bresenham(plat, plng, lat_grid, lng_grid):
                     cell = (gx, gy)
-                    acc_all[cell] += 1
+                    acc_all[cell] += weight
                     if p_ev:
-                        acc_ev[cell] += 1
+                        acc_ev[cell] += weight
                     if p_hw:
-                        acc_hw[cell] += 1
+                        acc_hw[cell] += weight
                     if p_os:
-                        acc_os[cell] += 1
+                        acc_os[cell] += weight
             else:
                 # GPS anomaly — count only the current endpoint
                 cell = (lat_grid, lng_grid)
-                acc_all[cell] += 1
+                acc_all[cell] += 1.0
                 if is_ev:
-                    acc_ev[cell] += 1
+                    acc_ev[cell] += 1.0
                 if highway:
-                    acc_hw[cell] += 1
+                    acc_hw[cell] += 1.0
                 if overspeed:
-                    acc_os[cell] += 1
+                    acc_os[cell] += 1.0
         else:
             # First point of a trip
             cell = (lat_grid, lng_grid)
-            acc_all[cell] += 1
+            acc_all[cell] += 1.0
             if is_ev:
-                acc_ev[cell] += 1
+                acc_ev[cell] += 1.0
             if highway:
-                acc_hw[cell] += 1
+                acc_hw[cell] += 1.0
             if overspeed:
-                acc_os[cell] += 1
+                acc_os[cell] += 1.0
 
         prev = (lat_grid, lng_grid, overspeed, highway, is_ev, trip_id)
 
