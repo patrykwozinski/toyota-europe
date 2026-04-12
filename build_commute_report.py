@@ -18,7 +18,7 @@ from fuel_config import (
 )
 
 DB_PATH = Path(__file__).parent / "trips.db"
-DEFAULT_RADIUS = 0.01  # ~1 km
+DEFAULT_RADIUS = 0.015  # ~1.5 km
 CO2_KG_PER_LITER = 2.31
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
