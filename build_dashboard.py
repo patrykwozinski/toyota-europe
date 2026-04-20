@@ -68,7 +68,7 @@ def load_all_vehicles(conn: sqlite3.Connection) -> list[dict]:
 def load_trips(conn: sqlite3.Connection, vin: str, tz_name: str = "Europe/Warsaw") -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT * FROM trips WHERE vin = ? ORDER BY trip_start_time", (vin,)
+        "SELECT * FROM trips WHERE vin = ? AND distance_km >= 0.5 ORDER BY trip_start_time", (vin,)
     ).fetchall()
     result = []
     tz = ZoneInfo(tz_name)

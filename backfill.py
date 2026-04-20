@@ -13,7 +13,7 @@ from pytoyoda.client import MyT
 DB_PATH = Path(__file__).parent / "trips.db"
 # Full backfill goes back to 2024; incremental starts from last known trip
 FULL_BACKFILL_START = date(2024, 1, 1)
-BACKFILL_END = date.today()
+BACKFILL_END = date.today() + timedelta(days=1)
 WINDOW_DAYS = 30
 
 
